@@ -42,6 +42,8 @@ const wsSessionDuration = new Trend('ws_session_duration_ms');
 const visitOk = new Counter('visit_lot_ok');
 const connectedOk = new Counter('connected_ok');
 const connectedFail = new Counter('connected_fail');
+const pingReceived = new Counter('ws_ping_received');
+const pongSent = new Counter('ws_pong_sent');
 
 export const BUYER_USER = [
   { username: 'donbuyer01', password: 'P@ssw0rd08', loginType: 'buyer' },
@@ -81,10 +83,14 @@ function parseDurationMs(value, fallbackMs) {
 }
 
 // ค้าง WS หลัง join สำเร็จ — default 5 นาที
-const WS_HOLD_MS = parseDurationMs(__ENV.WS_HOLD_MS || __ENV.WS_HOLD || '5m', 5 * 60 * 1000);
+const WS_HOLD_MS = parseDurationMs(__ENV.WS_HOLD_MS || __ENV.WS_HOLD || '30m', 30 * 60 * 1000);
 const MAX_DURATION =
   __ENV.MAX_DURATION ||
   `${Math.max(2, Math.ceil((WS_HOLD_MS + WS_TIMEOUT_MS + 60000) / 60000))}m`;
+
+function nowIso() {
+  return new Date().toISOString();
+}
 
 function logInfo(action, detail) {
   const extra = detail ? ` | ${detail}` : '';
@@ -394,6 +400,43 @@ function runWebsocketVisitConnected(session, bidderNumber) {
     url,
     { headers, tags: { name: 'WS visitLot + connected + hold', username: buyer.username } },
     function (socket) {
+      function sendOfferBid() {
+        if (failed || !holding) return;
+        const ts = nowIso();
+        const msg = buildWsMessage('offer', {
+          lots: [LOT_ID],
+          payload: {
+            action: OFFER_ACTION,
+            lotLineId: LOT_LINE_ID,
+            auctionNo: AUCTION_NO,
+            event: OFFER_EVENT,
+            bidderNumber: String(bidderNumber),
+          },
+        });
+        logInfo('ws.offer.send', `user=${buyer.username} ts=${ts} ${summarizeWsMessage(msg)}`);
+        socket.send(JSON.stringify(msg));
+        offerSent.add(1);
+      }
+
+      /** ส่ง offer ทุก OFFER_INTERVAL_MS แบบ sync ตามขอบวินาที wall-clock */
+      function startSyncedOfferLoop() {
+        if (OFFER_INTERVAL_MS <= 0) {
+          logInfo('ws.offer.skip', `user=${buyer.username} reason=OFFER_INTERVAL_MS<=0`);
+          return;
+        }
+        const firstWait = msUntilNextInterval(OFFER_INTERVAL_MS);
+        logInfo(
+          'ws.offer.loop.start',
+          `user=${buyer.username} intervalMs=${OFFER_INTERVAL_MS} firstWaitMs=${firstWait} — sync all VUs on wall-clock`
+        );
+        socket.setTimeout(function offerTick() {
+          if (failed || !holding) return;
+          sendOfferBid();
+          const nextWait = msUntilNextInterval(OFFER_INTERVAL_MS);
+          socket.setTimeout(offerTick, nextWait);
+        }, firstWait);
+      }
+
       socket.on('open', function () {
         logInfo('ws.open', `user=${buyer.username} status=connected`);
 
@@ -450,7 +493,15 @@ function runWebsocketVisitConnected(session, bidderNumber) {
 
         // ตอบ ping ตลอดช่วง hold เพื่อไม่ให้ถูกตัด
         if (msg && msg.type === 'ping') {
-          sendWs(socket, buyer, 'pong');
+          const pingTs = nowIso();
+          logInfo('ws.ping.recv', `user=${buyer.username} ts=${pingTs} ${summarizeWsMessage(msg)}`);
+          pingReceived.add(1);
+
+          const pongMsg = buildWsMessage('pong');
+          const pongTs = nowIso();
+          logInfo('ws.pong.send', `user=${buyer.username} ts=${pongTs} ${summarizeWsMessage(pongMsg)}`);
+          socket.send(JSON.stringify(pongMsg));
+          pongSent.add(1);
           return;
         }
 
