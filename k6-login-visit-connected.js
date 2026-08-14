@@ -4,9 +4,12 @@
  * BUYER_USER = array ของ buyer
  * Default: เปิด VU พร้อมกัน = จำนวน buyer (1 VU : 1 user) แล้วแต่ละ VU รันครบทุก action
  *
- * บริบท: ทุก buyer connect แล้วค้าง WebSocket + ส่ง offer (bid) ทุก 1 วินาทีพร้อมกัน
+ * บริบท: ทุก buyer connect แล้วค้าง WebSocket แล้วส่ง offer ซ้ำจนหมด WS_HOLD
+ * Default: ACK=true + STAGGER — ยิงทีละข้อความ รอ notification ก่อนยิงต่อ และ offset ตาม VU
+ * BID_AFTER_OFFER=true: หลัง offer สำเร็จ/E5013 สลับเป็น bidding
+ * ACK=false: โหมดเดิม ทุก VU ส่ง offer พร้อมกันตาม wall-clock (ใช้ทดสอบ lock / E5002)
  *
- * รันตัวอย่าง (parallel + hold connection):
+ * รันตัวอย่าง (stagger + รอ ack):
  *   k6 run k6-login-visit-connected.js \
  *     -e BASE_URL=https://auctlive-sit.auct.co.th/api/v1 \
  *     -e WS_URL=wss://auctlive-sit.auct.co.th/api/v1/websocket \
@@ -22,11 +25,17 @@
  *   WS_TIMEOUT_MS=15000 # timeout ตอน join (ยังไม่ connected)
  *   JOIN_SETTLE_MS=1000 # รอหลังส่ง connected ก่อนถือว่า join สำเร็จ
  *   WS_HOLD=5m          # ค้าง connection หลัง join สำเร็จ (รองรับ ms|s|m|h หรือตัวเลข ms)
- *   LOT_LINE_ID=10360   # payload.lotLineId ของ offer
- *   AUCTION_NO=1        # payload.auctionNo ของ offer
- *   OFFER_EVENT=online  # payload.event ของ offer
- *   OFFER_INTERVAL_MS=1000  # ส่ง offer ทุก N ms (sync ตาม wall-clock ให้ทุก VU พร้อมกัน)
- *   OFFER=true          # false = ไม่ส่ง offer ช่วง hold
+ *   LOT_LINE_ID=10360   # payload.lotLineId ของ offer/bidding
+ *   AUCTION_NO=1        # payload.auctionNo ของ offer/bidding
+ *   OFFER_EVENT=online  # payload.event ของ offer/bidding
+ *   OFFER=true          # false = ไม่ส่ง offer/bidding ช่วง hold
+ *   ACK=true            # false = ยิง offer ซ้ำตาม OFFER_INTERVAL_MS (sync ทุก VU)
+ *   STAGGER_MS=250      # delay ของ VU n = (n-1)*STAGGER_MS (ใช้เมื่อ ACK=true)
+ *   ACK_TIMEOUT_MS=2000 # รอ notification นานสุดต่อ 1 ข้อความ
+ *   ACK_RETRY_MS=400    # รอหลัง E5002 / timeout ก่อนยิงใหม่
+ *   ACK_COOLDOWN_MS=800 # รอหลังสำเร็จ ก่อนยิง offer/bidding รอบถัดไป
+ *   BID_AFTER_OFFER=false # true = หลัง offer สำเร็จหรือ E5013 สลับเป็น bidding
+ *   OFFER_INTERVAL_MS=1000  # ใช้เมื่อ ACK=false เท่านั้น
  *   LOG_WS_MSG=true
  *   REPORT_DIR=k6-reports
  *   REPORT_BASENAME=login-visit-connected
@@ -50,6 +59,10 @@ const connectedFail = new Counter('connected_fail');
 const pingReceived = new Counter('ws_ping_received');
 const pongSent = new Counter('ws_pong_sent');
 const offerSent = new Counter('ws_offer_sent');
+const biddingSent = new Counter('ws_bidding_sent');
+const ackOk = new Counter('ws_ack_ok');
+const ackRetry = new Counter('ws_ack_retry');
+const ackTimeout = new Counter('ws_ack_timeout');
 
 export const BUYER_USER = [
   { username: 'donbuyer01', password: 'P@ssw0rd08', loginType: 'buyer' },
@@ -77,6 +90,23 @@ const OFFER_EVENT = String(__ENV.OFFER_EVENT || 'online');
 const OFFER_INTERVAL_MS = Number(__ENV.OFFER_INTERVAL_MS || 1000);
 const OFFER_ENABLED = String(__ENV.OFFER || 'true').toLowerCase() !== 'false';
 const LOG_WS_MSG = String(__ENV.LOG_WS_MSG || 'false').toLowerCase() === 'true';
+
+function envFlag(name, defaultValue) {
+  const raw = __ENV[name];
+  if (raw == null || raw === '') return defaultValue;
+  const s = String(raw).toLowerCase();
+  if (s === 'true' || s === '1' || s === 'yes') return true;
+  if (s === 'false' || s === '0' || s === 'no') return false;
+  return defaultValue;
+}
+
+const ACK_ENABLED = envFlag('ACK', true);
+const BID_AFTER_OFFER = envFlag('BID_AFTER_OFFER', false);
+const STAGGER_MS = Number(__ENV.STAGGER_MS || 250);
+const ACK_TIMEOUT_MS = Number(__ENV.ACK_TIMEOUT_MS || 2000);
+const ACK_RETRY_MS = Number(__ENV.ACK_RETRY_MS || 400);
+const ACK_COOLDOWN_MS = Number(__ENV.ACK_COOLDOWN_MS || 800);
+const ACK_TICK_MS = Number(__ENV.ACK_TICK_MS || 50);
 
 function parseDurationMs(value, fallbackMs) {
   if (value == null || value === '') return fallbackMs;
@@ -161,7 +191,23 @@ function requireEnv() {
     if (!Number.isFinite(AUCTION_NO) || AUCTION_NO <= 0) {
       fail(`ขาด/ผิด env: AUCTION_NO — ตัวอย่าง: -e AUCTION_NO=1`);
     }
-    if (!Number.isFinite(OFFER_INTERVAL_MS) || OFFER_INTERVAL_MS <= 0) {
+    if (ACK_ENABLED) {
+      if (!Number.isFinite(STAGGER_MS) || STAGGER_MS < 0) {
+        fail(`ผิด env: STAGGER_MS ต้องเป็นจำนวน >= 0 (ms)`);
+      }
+      if (!Number.isFinite(ACK_TIMEOUT_MS) || ACK_TIMEOUT_MS <= 0) {
+        fail(`ผิด env: ACK_TIMEOUT_MS ต้องเป็นจำนวนบวก (ms)`);
+      }
+      if (!Number.isFinite(ACK_RETRY_MS) || ACK_RETRY_MS < 0) {
+        fail(`ผิด env: ACK_RETRY_MS ต้องเป็นจำนวน >= 0 (ms)`);
+      }
+      if (!Number.isFinite(ACK_COOLDOWN_MS) || ACK_COOLDOWN_MS < 0) {
+        fail(`ผิด env: ACK_COOLDOWN_MS ต้องเป็นจำนวน >= 0 (ms)`);
+      }
+      if (!Number.isFinite(ACK_TICK_MS) || ACK_TICK_MS <= 0) {
+        fail(`ผิด env: ACK_TICK_MS ต้องเป็นจำนวนบวก (ms)`);
+      }
+    } else if (!Number.isFinite(OFFER_INTERVAL_MS) || OFFER_INTERVAL_MS <= 0) {
       fail(`ผิด env: OFFER_INTERVAL_MS ต้องเป็นจำนวนบวก (ms)`);
     }
   }
@@ -342,6 +388,56 @@ function isJoinError(msg) {
   return false;
 }
 
+function msgCode(msg) {
+  const payload = msg && msg.payload ? msg.payload : {};
+  return String(payload.code || '');
+}
+
+function isAckExpectedError(code) {
+  return (
+    code === 'E5002' ||
+    code === 'E5013' ||
+    code === 'WS20003' ||
+    code === 'WS20005' ||
+    code === 'WS20009' ||
+    code === 'WS20010' ||
+    code === 'WS20012' ||
+    code === 'WS40002' ||
+    code === 'WS40003' ||
+    code === 'WS40004'
+  );
+}
+
+function offerBlockedStatus(status) {
+  return (
+    status === 'pause' ||
+    status === 'sold' ||
+    status === 'pass' ||
+    status === 'hold' ||
+    status === 'waiting' ||
+    status === 'open'
+  );
+}
+
+function bidBlockedStatus(status) {
+  return (
+    status === 'pause' ||
+    status === 'sold' ||
+    status === 'pass' ||
+    status === 'hold' ||
+    status === 'waiting' ||
+    status === 'pending' ||
+    status === 'ready'
+  );
+}
+
+function isOwnBidder(payload, bidderNumber, userId) {
+  const p = payload || {};
+  if (bidderNumber && String(p.bidderNumber || '') === String(bidderNumber)) return true;
+  if (userId && String(p.userId || '') === String(userId)) return true;
+  return false;
+}
+
 /**
  * สร้าง WS message แบบ dynamic
  * @param {string} type
@@ -424,7 +520,25 @@ function sendOffer(socket, buyer, bidderNumber) {
   return msg;
 }
 
-function runWebsocketVisitConnected(session, bidderNumber) {
+function sendBidding(socket, buyer, bidderNumber) {
+  const msg = buildWsMessage('bidding', {
+    lots: [LOT_ID],
+    payload: {
+      action: 'bid',
+      lotLineId: LOT_LINE_ID,
+      auctionNo: AUCTION_NO,
+      event: OFFER_EVENT,
+      bidderNumber: String(bidderNumber),
+    },
+  });
+  const ts = nowIso();
+  logInfo('ws.bidding.send', `user=${buyer.username} ts=${ts} ${summarizeWsMessage(msg)}`);
+  socket.send(JSON.stringify(msg));
+  biddingSent.add(1);
+  return msg;
+}
+
+function runWebsocketVisitConnected(session, bidderNumber, userId) {
   const buyer = session.buyer;
   const headers = {
     Authorization: `Bearer ${session.accessToken}`,
@@ -437,7 +551,7 @@ function runWebsocketVisitConnected(session, bidderNumber) {
   const url = `${WS_URL}?userType=${encodeURIComponent(buyer.loginType)}&service=websocket-service`;
   logInfo(
     'ws.connect.start',
-    `user=${buyer.username} url=${url} lotId=${LOT_ID} bidderNumber=${bidderNumber} settleMs=${JOIN_SETTLE_MS} joinTimeoutMs=${WS_TIMEOUT_MS} holdMs=${WS_HOLD_MS} offer=${OFFER_ENABLED} offerIntervalMs=${OFFER_INTERVAL_MS}`
+    `user=${buyer.username} url=${url} lotId=${LOT_ID} bidderNumber=${bidderNumber} userId=${userId || '-'} settleMs=${JOIN_SETTLE_MS} joinTimeoutMs=${WS_TIMEOUT_MS} holdMs=${WS_HOLD_MS} offer=${OFFER_ENABLED} ack=${ACK_ENABLED} staggerMs=${STAGGER_MS} offerIntervalMs=${OFFER_INTERVAL_MS}`
   );
 
   const started = Date.now();
@@ -446,11 +560,191 @@ function runWebsocketVisitConnected(session, bidderNumber) {
   let connectedDone = false;
   let failed = false;
   let holding = false;
+  const ack = {
+    pending: false,
+    phase: 'offer',
+    retryAt: 0,
+    lastBidUserId: '',
+    lastAuctionStatus: '',
+    ackGen: 0,
+  };
+
+  function switchPhase(next, reason) {
+    if (ack.phase === next) return;
+    logInfo('ws.ack.phase', `user=${buyer.username} ${ack.phase} → ${next} reason=${reason}`);
+    ack.phase = next;
+  }
 
   const res = ws.connect(
     url,
     { headers, tags: { name: 'WS visitLot + connected + hold', username: buyer.username } },
     function (socket) {
+      function armAckTimeout() {
+        const gen = ++ack.ackGen;
+        socket.setTimeout(function () {
+          if (gen !== ack.ackGen || !ack.pending || !holding || failed) return;
+          ack.pending = false;
+          ack.retryAt = Date.now() + ACK_RETRY_MS;
+          ackTimeout.add(1);
+          logInfo(
+            'ws.ack.timeout',
+            `user=${buyer.username} phase=${ack.phase} timeoutMs=${ACK_TIMEOUT_MS} retryInMs=${ACK_RETRY_MS}`
+          );
+        }, ACK_TIMEOUT_MS);
+      }
+
+      function trySendAck() {
+        if (!holding || failed || ack.pending || ack.phase === 'idle') return;
+        if (Date.now() < ack.retryAt) return;
+        if (ack.phase === 'offer' && BID_AFTER_OFFER && offerBlockedStatus(ack.lastAuctionStatus)) {
+          switchPhase('bidding', `status=${ack.lastAuctionStatus || '-'}`);
+          return;
+        }
+        if (ack.phase === 'bidding') {
+          if (bidBlockedStatus(ack.lastAuctionStatus)) return;
+          if (userId && ack.lastBidUserId && ack.lastBidUserId === String(userId)) return;
+        }
+
+        ack.pending = true;
+        ack.ackGen += 1;
+        if (ack.phase === 'offer') {
+          sendOffer(socket, buyer, bidderNumber);
+        } else {
+          sendBidding(socket, buyer, bidderNumber);
+        }
+        armAckTimeout();
+      }
+
+      // k6 socket.setTimeout rejects delay <= 0 (VU 1 stagger is 0 by design).
+      function schedule(fn, delayMs) {
+        const ms = Number(delayMs);
+        if (!Number.isFinite(ms) || ms <= 0) {
+          fn();
+          return;
+        }
+        socket.setTimeout(fn, ms);
+      }
+
+      // Must register setInterval in the connect callback (not inside setTimeout).
+      // Nested setInterval never ticks — that is why offer ran once then stopped.
+      let ackReadyAt = Number.POSITIVE_INFINITY;
+      if (ACK_ENABLED && OFFER_ENABLED) {
+        socket.setInterval(function () {
+          if (!holding || failed) return;
+          if (Date.now() < ackReadyAt) return;
+          trySendAck();
+        }, ACK_TICK_MS);
+      }
+
+      function startAckLoop() {
+        const staggerMs = Math.max(0, (__VU - 1) * STAGGER_MS);
+        ackReadyAt = Date.now() + staggerMs;
+        logInfo(
+          'ws.ack.loop.start',
+          `user=${buyer.username} lotId=${LOT_ID} lotLineId=${LOT_LINE_ID} auctionNo=${AUCTION_NO} event=${OFFER_EVENT} bidderNumber=${bidderNumber} staggerMs=${staggerMs} timeoutMs=${ACK_TIMEOUT_MS} retryMs=${ACK_RETRY_MS} cooldownMs=${ACK_COOLDOWN_MS} bidAfterOffer=${BID_AFTER_OFFER}`
+        );
+        if (staggerMs <= 0) trySendAck();
+      }
+
+      function startAlignedOfferLoop() {
+        const alignMs = msUntilNextAlignedTick(OFFER_INTERVAL_MS);
+        logInfo(
+          'ws.offer.loop.start',
+          `user=${buyer.username} lotId=${LOT_ID} lotLineId=${LOT_LINE_ID} auctionNo=${AUCTION_NO} event=${OFFER_EVENT} bidderNumber=${bidderNumber} intervalMs=${OFFER_INTERVAL_MS} alignMs=${alignMs}`
+        );
+        function tick() {
+          if (failed || !holding) return;
+          sendOffer(socket, buyer, bidderNumber);
+          socket.setTimeout(tick, OFFER_INTERVAL_MS);
+        }
+        schedule(tick, alignMs);
+      }
+
+      function handleAckMessage(msg) {
+        const type = msg && msg.type ? msg.type : '';
+        const payload = msg && msg.payload ? msg.payload : {};
+        const code = msgCode(msg);
+
+        if (type === 'bidInfo') {
+          ack.lastBidUserId = String(payload.userId || '');
+          ack.lastAuctionStatus = String(payload.auctionStatus || '');
+          if (ack.phase === 'offer' && BID_AFTER_OFFER && offerBlockedStatus(ack.lastAuctionStatus)) {
+            ack.pending = false;
+            switchPhase('bidding', `bidInfo.status=${ack.lastAuctionStatus}`);
+          }
+          return;
+        }
+
+        const isNotif = type === 'notification';
+        const isBroadcast = type === 'broadcastBuyer' || type === 'broadcastSeller';
+        if (!isNotif && !isBroadcast) return;
+
+        if (code === 'WS40005' || (code === 'WS40001' && isOwnBidder(payload, bidderNumber, userId))) {
+          ack.pending = false;
+          ack.ackGen += 1;
+          ack.lastBidUserId = String(userId || payload.userId || '');
+          ack.retryAt = Date.now() + ACK_COOLDOWN_MS;
+          ackOk.add(1);
+          if (ack.phase === 'offer' && BID_AFTER_OFFER) {
+            switchPhase('bidding', code);
+          }
+          logInfo('ws.ack.ok', `user=${buyer.username} code=${code} phase=${ack.phase}`);
+          return;
+        }
+
+        if (code === 'WS20001' && isOwnBidder(payload, bidderNumber, userId)) {
+          ack.pending = false;
+          ack.ackGen += 1;
+          ack.lastBidUserId = String(userId || payload.userId || '');
+          ack.retryAt = Date.now() + ACK_COOLDOWN_MS;
+          ackOk.add(1);
+          logInfo('ws.ack.ok', `user=${buyer.username} code=${code} phase=${ack.phase}`);
+          return;
+        }
+
+        if (!ack.pending && !isAckExpectedError(code)) return;
+
+        if (code === 'E5002') {
+          ack.pending = false;
+          ack.ackGen += 1;
+          ack.retryAt = Date.now() + ACK_RETRY_MS;
+          ackRetry.add(1);
+          logInfo('ws.ack.retry', `user=${buyer.username} code=E5002 waitMs=${ACK_RETRY_MS} phase=${ack.phase}`);
+          return;
+        }
+
+        if (code === 'E5013') {
+          ack.pending = false;
+          ack.ackGen += 1;
+          ack.retryAt = Date.now() + ACK_RETRY_MS;
+          ackRetry.add(1);
+          if (ack.phase === 'offer' && BID_AFTER_OFFER) {
+            switchPhase('bidding', 'E5013');
+            logInfo('ws.ack.switch', `user=${buyer.username} code=E5013 phase=${ack.phase}`);
+          } else {
+            logInfo('ws.ack.retry', `user=${buyer.username} code=E5013 waitMs=${ACK_RETRY_MS} phase=${ack.phase}`);
+          }
+          return;
+        }
+
+        if (code === 'WS20003') {
+          ack.pending = false;
+          ack.ackGen += 1;
+          ack.lastBidUserId = String(userId || '');
+          ack.retryAt = Date.now() + ACK_COOLDOWN_MS;
+          logInfo('ws.ack.self', `user=${buyer.username} code=WS20003 waitMs=${ACK_COOLDOWN_MS}`);
+          return;
+        }
+
+        if (isAckExpectedError(code)) {
+          ack.pending = false;
+          ack.ackGen += 1;
+          ack.retryAt = Date.now() + ACK_RETRY_MS;
+          ackRetry.add(1);
+          logInfo('ws.ack.retry', `user=${buyer.username} code=${code} waitMs=${ACK_RETRY_MS} phase=${ack.phase}`);
+        }
+      }
+
       socket.on('open', function () {
         logInfo('ws.open', `user=${buyer.username} status=connected`);
 
@@ -476,7 +770,6 @@ function runWebsocketVisitConnected(session, bidderNumber) {
         });
         connectedSent = true;
 
-        // join สำเร็จแล้ว → ค้าง connection + ส่ง offer ทุก 1 วินาที (sync ทุก VU)
         socket.setTimeout(function () {
           if (failed || connectedDone) return;
           connectedDone = true;
@@ -485,23 +778,15 @@ function runWebsocketVisitConnected(session, bidderNumber) {
           check(null, { 'ws connected settled': () => true });
           logInfo(
             'ws.hold.start',
-            `user=${buyer.username} lotId=${LOT_ID} holdMs=${WS_HOLD_MS} — keep connection open in system`
+            `user=${buyer.username} lotId=${LOT_ID} holdMs=${WS_HOLD_MS} ack=${ACK_ENABLED} — keep connection open in system`
           );
 
           if (OFFER_ENABLED) {
-            const alignMs = msUntilNextAlignedTick(OFFER_INTERVAL_MS);
-            logInfo(
-              'ws.offer.loop.start',
-              `user=${buyer.username} lotId=${LOT_ID} lotLineId=${LOT_LINE_ID} auctionNo=${AUCTION_NO} event=${OFFER_EVENT} bidderNumber=${bidderNumber} intervalMs=${OFFER_INTERVAL_MS} alignMs=${alignMs}`
-            );
-            socket.setTimeout(function () {
-              if (failed || !holding) return;
-              sendOffer(socket, buyer, bidderNumber);
-              socket.setInterval(function () {
-                if (failed || !holding) return;
-                sendOffer(socket, buyer, bidderNumber);
-              }, OFFER_INTERVAL_MS);
-            }, alignMs);
+            if (ACK_ENABLED) {
+              startAckLoop();
+            } else {
+              startAlignedOfferLoop();
+            }
           } else {
             logInfo('ws.offer.skip', `user=${buyer.username} reason=OFFER=false`);
           }
@@ -524,7 +809,6 @@ function runWebsocketVisitConnected(session, bidderNumber) {
           return;
         }
 
-        // ตอบ ping ตลอดช่วง hold เพื่อไม่ให้ถูกตัด
         if (msg && msg.type === 'ping') {
           const pingTs = nowIso();
           logInfo('ws.ping.recv', `user=${buyer.username} ts=${pingTs} ${summarizeWsMessage(msg)}`);
@@ -538,6 +822,10 @@ function runWebsocketVisitConnected(session, bidderNumber) {
           return;
         }
 
+        if (ACK_ENABLED && holding && OFFER_ENABLED) {
+          handleAckMessage(msg);
+        }
+
         if (LOG_WS_MSG) {
           const code = msg.payload && msg.payload.code ? msg.payload.code : '';
           logInfo(
@@ -546,7 +834,6 @@ function runWebsocketVisitConnected(session, bidderNumber) {
           );
         }
 
-        // error ระหว่าง join เท่านั้นที่ตัด — ช่วง hold แค่ log
         if (!connectedDone && (visitSent || connectedSent) && isJoinError(msg)) {
           failed = true;
           connectedDone = true;
@@ -557,6 +844,10 @@ function runWebsocketVisitConnected(session, bidderNumber) {
           );
           socket.close();
         } else if (holding && isJoinError(msg)) {
+          const code = msgCode(msg);
+          if (ACK_ENABLED && isAckExpectedError(code)) {
+            return;
+          }
           console.error(
             `[ERROR][vu=${__VU} iter=${__ITER}] ws.hold.notification_error user=${buyer.username} lotId=${LOT_ID} msg=${raw}`
           );
@@ -568,10 +859,9 @@ function runWebsocketVisitConnected(session, bidderNumber) {
       });
 
       socket.on('close', function () {
-        logInfo('ws.close', `user=${buyer.username} holdingWas=${holding} failed=${failed}`);
+        logInfo('ws.close', `user=${buyer.username} holdingWas=${holding} failed=${failed} phase=${ack.phase}`);
       });
 
-      // timeout เฉพาะกรณียัง join ไม่สำเร็จ
       socket.setTimeout(function () {
         if (connectedDone || failed) return;
         failed = true;
@@ -602,7 +892,7 @@ export default function () {
 
   logInfo(
     'iteration.start',
-    `baseUrl=${BASE_URL} wsUrl=${WS_URL} lotId=${LOT_ID} buyerCount=${BUYER_USER.length} vus=${VUS} executor=${EXECUTOR} userPick=${USER_PICK}`
+    `baseUrl=${BASE_URL} wsUrl=${WS_URL} lotId=${LOT_ID} buyerCount=${BUYER_USER.length} vus=${VUS} executor=${EXECUTOR} userPick=${USER_PICK} ack=${ACK_ENABLED} staggerMs=${STAGGER_MS}`
   );
 
   const { buyer, idx } = pickBuyer();
@@ -618,15 +908,17 @@ export default function () {
     return;
   }
 
-  let profileOk = false;
+  let profile = null;
   group(`2. GET /users/user-profile (${buyer.username})`, () => {
-    profileOk = !!getUserProfile(session);
+    profile = getUserProfile(session);
   });
-  if (!profileOk) {
+  if (!profile) {
     logInfo('iteration.abort', `reason=user_profile_failed user=${buyer.username}`);
     sleep(1);
     return;
   }
+  const userId =
+    profile.userId != null ? String(profile.userId) : profile.id != null ? String(profile.id) : '';
 
   group(`3. POST /users/lot-bidder-number (${buyer.username})`, () => {
     bidderNumber = getLotBidderNumber(session);
@@ -638,7 +930,7 @@ export default function () {
   }
 
   group(`4. WS visitLot → connected (${buyer.username})`, () => {
-    runWebsocketVisitConnected(session, bidderNumber);
+    runWebsocketVisitConnected(session, bidderNumber, userId);
   });
 
   logInfo('iteration.done', `user=${buyer.username} lotId=${LOT_ID} bidderNumber=${bidderNumber}`);
@@ -664,6 +956,12 @@ export const handleSummary = createHandleSummary(function () {
       wsHoldMs: WS_HOLD_MS,
       joinSettleMs: JOIN_SETTLE_MS,
       offerEnabled: OFFER_ENABLED,
+      ackEnabled: ACK_ENABLED,
+      bidAfterOffer: BID_AFTER_OFFER,
+      staggerMs: STAGGER_MS,
+      ackTimeoutMs: ACK_TIMEOUT_MS,
+      ackRetryMs: ACK_RETRY_MS,
+      ackCooldownMs: ACK_COOLDOWN_MS,
       offerIntervalMs: OFFER_INTERVAL_MS,
       lotLineId: LOT_LINE_ID,
       auctionNo: AUCTION_NO,

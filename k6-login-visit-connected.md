@@ -4,7 +4,7 @@
 
 ## วัตถุประสงค์
 
-ทดสอบ flow ของ Buyer ตั้งแต่ล็อกอินจนเข้าลานประมูลผ่าน WebSocket โดยยัง**ไม่**รวมการเสนอราคา (`offer` / `bidding`)
+ทดสอบ flow ของ Buyer ตั้งแต่ล็อกอินจนเข้าลานประมูลผ่าน WebSocket แล้วค้าง connection เพื่อส่ง `offer` / `bidding`
 
 ลำดับที่ทดสอบ:
 
@@ -13,6 +13,7 @@
 3. `POST /users/lot-bidder-number`
 4. WebSocket `type=visitLot`
 5. WebSocket `type=connected`
+6. ช่วง hold: ส่ง `offer`/`bidding` แบบ stagger + รอ ack (default)
 
 ## แผนภาพลำดับงาน
 
@@ -36,7 +37,9 @@ sequenceDiagram
     K6->>WS: visitLot (lots, entryKey)
     K6->>WS: connected (lots, entryKey, bidderNumber)
     WS-->>K6: ping / notification
-    Note over K6: settle JOIN_SETTLE_MS แล้วปิด socket
+    K6->>WS: offer / bidding (stagger + wait ack)
+    WS-->>K6: WS40005 / WS20001 / E5002 / E5013
+    Note over K6: ค้าง socket ตาม WS_HOLD
 ```
 
 ## การตั้งค่า
@@ -117,6 +120,14 @@ export const BUYER_USER = [
 | `WS_TIMEOUT_MS` | ไม่ | `15000` | ปิด WS ถ้ายังไม่ settle ภายในเวลานี้ |
 | `JOIN_SETTLE_MS` | ไม่ | `1000` | รอหลังส่ง `connected` ก่อนถือว่าสำเร็จ |
 | `LOG_WS_MSG` | ไม่ | `false` | `true` = log ข้อความ WS ที่รับเข้า (ยกเว้น ping) |
+| `OFFER` | ไม่ | `true` | `false` = ค้าง WS อย่างเดียว ไม่ส่ง offer/bidding |
+| `ACK` | ไม่ | `true` | รอ notification ก่อนยิงรอบถัดไป (กัน E5002 รัว) |
+| `STAGGER_MS` | ไม่ | `250` | delay ของ VU n = `(n-1) * STAGGER_MS` เมื่อ `ACK=true` |
+| `ACK_TIMEOUT_MS` | ไม่ | `2000` | รอ ack นานสุดต่อ 1 ข้อความ |
+| `ACK_RETRY_MS` | ไม่ | `400` | รอหลัง E5002 / timeout ก่อนยิงใหม่ |
+| `ACK_COOLDOWN_MS` | ไม่ | `800` | รอหลังสำเร็จ ก่อนยิง bidding รอบถัดไป |
+| `BID_AFTER_OFFER` | ไม่ | `true` | หลัง `WS40005` หรือ `E5013` สลับเป็น `bidding` |
+| `OFFER_INTERVAL_MS` | ไม่ | `1000` | ใช้เมื่อ `ACK=false` — ยิง offer ซ้ำแบบ sync ทุก VU |
 | `REPORT_DIR` | ไม่ | `k6-reports` | root ของรายงาน |
 | `REPORT_BASENAME` | ไม่ | `login-visit-connected` | ชื่อไฟล์ไม่รวมนามสกุล |
 | `REPORT_JSON` | ไม่ | auto | override path JSON เต็ม |
@@ -134,6 +145,16 @@ k6 run k6-login-visit-connected.js \
 
 จะเห็น log พร้อมกันหลาย VU เช่น `vu=1`…`vu=8` ทำ login/profile/WS พร้อมกัน
 
+Default (`ACK=true`) จะ stagger ตาม VU แล้วรอ notification ก่อนยิง offer/bidding รอบถัดไป
+
+```bash
+# โหมดปลอดภัย (default): stagger 250ms + รอ ack
+k6 run k6-login-visit-connected.js -e LOT_ID=975 -e WS_HOLD=5m
+
+# โหมดเดิม: ทุก VU ยิง offer พร้อมกันทุก 1s (ใช้ทดสอบ lock / E5002)
+k6 run k6-login-visit-connected.js -e LOT_ID=975 -e ACK=false -e OFFER_INTERVAL_MS=1000
+```
+
 ## Logging
 
 แต่ละ action จะพิมพ์ `[INFO][vu=…][iter=…]` เช่น:
@@ -142,7 +163,8 @@ k6 run k6-login-visit-connected.js \
 - `login.start` → `login.ok` (mask token/entryKey)
 - `user-profile.start` → `user-profile.ok`
 - `lot-bidder-number.start` → `lot-bidder-number.ok` (แสดง `bidderNumber`)
-- `ws.connect.start` → `ws.open` → `ws.visitLot.send` → `ws.connected.send` → `ws.connected.ok`
+- `ws.connect.start` → `ws.open` → `ws.visitLot.send` → `ws.connected.send` → `ws.hold.start`
+- `ws.ack.loop.start` / `ws.offer.send` / `ws.bidding.send` / `ws.ack.ok` / `ws.ack.retry` / `ws.ack.timeout`
 - fail ใช้ `[ERROR]…` และ `iteration.abort`
 
 เปิด log ข้อความ WS ที่รับเข้า:
@@ -226,9 +248,10 @@ export const handleSummary = createHandleSummary(() => ({
    - ส่ง `visitLot` พร้อม `lots` + `entryKey` (เข้าชมลาน)
    - ส่ง `connected` พร้อม `lots` + `entryKey` + `bidderNumber` (เข้าร่วมลาน)
 4. ตอบ `ping` ด้วย `pong`
-5. ถ้าได้ notification error (`level=error`, `WS00043`, connected incorrectly) → นับ fail แล้วปิด
-6. ถ้าไม่มี error ภายใน `JOIN_SETTLE_MS` → นับ `connected_ok` แล้วปิด socket
-7. ถ้าเกิน `WS_TIMEOUT_MS` ยังไม่จบ → นับ fail
+5. ถ้าได้ notification error (`level=error`, `WS00043`, connected incorrectly) ระหว่าง join → นับ fail แล้วปิด
+6. ถ้าไม่มี error ภายใน `JOIN_SETTLE_MS` → นับ `connected_ok` แล้ว**ค้าง socket** ตาม `WS_HOLD`
+7. ช่วง hold (default `ACK=true`): ส่ง `offer`/`bidding` ทีละข้อความ รอ ack ก่อนยิงต่อ โดย VU n หน่วง `(n-1)*STAGGER_MS`
+8. ถ้าเกิน `WS_TIMEOUT_MS` ยัง join ไม่สำเร็จ → นับ fail
 
 ## Metrics / Thresholds
 
@@ -241,6 +264,11 @@ export const handleSummary = createHandleSummary(() => ({
 | `visit_lot_ok` | Counter | ส่ง `visitLot` สำเร็จ |
 | `connected_ok` | Counter | settle `connected` สำเร็จ |
 | `connected_fail` | Counter | join/connected ล้มเหลวหรือ timeout |
+| `ws_offer_sent` | Counter | จำนวน `offer` ที่ส่ง |
+| `ws_bidding_sent` | Counter | จำนวน `bidding` ที่ส่ง |
+| `ws_ack_ok` | Counter | ได้ ack สำเร็จ (`WS40005` / `WS20001`) |
+| `ws_ack_retry` | Counter | ได้ E5002/E5013 แล้วรอ retry |
+| `ws_ack_timeout` | Counter | ส่งแล้วไม่ได้รับ ack ภายใน `ACK_TIMEOUT_MS` |
 
 Threshold หลัก:
 
@@ -250,7 +278,9 @@ Threshold หลัก:
 
 ## ข้อควรรู้
 
-- สคริปต์นี้**ไม่**ยิง `POST /datahub/product/collateral` และ**ไม่**ส่ง `offer` / `bidding`
+- สคริปต์นี้**ไม่**ยิง `POST /datahub/product/collateral`
+- Default จะส่ง `offer` แล้วสลับเป็น `bidding` หลังได้ `WS40005` หรือ `E5013` (`BID_AFTER_OFFER=true`)
+- `ACK=false` คือโหมดเดิมที่ยิง offer พร้อมกันทุก VU — คาดว่าจะเห็น E5002
 - `LOT_ID` ต้องเป็นลานที่มีอยู่จริง และบัญชี buyer ต้องมีสิทธิ์/ลงทะเบียนจนได้ `bidderNumber`
 - ถ้า login ได้ `E2001` แสดงว่า username/`loginType` ไม่ตรงกับ user บน environment นั้น — แก้ที่ `BUYER_USER`
 - Gateway ต้อง map JWT/cookie เป็น `X-Auth-User-Id` / `X-Auth-User-Type` สำหรับ `/users/*` และ WebSocket

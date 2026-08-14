@@ -103,7 +103,7 @@ Or full path override:
 
 ### `k6-login-visit-connected.js`
 
-Buyer flow under test (no collateral, no `offer` / `bidding`):
+Buyer flow under test (no collateral). After join, default `ACK=true` sends `offer`/`bidding` with stagger + wait-ack:
 
 | Step | Action |
 | --- | --- |
@@ -112,7 +112,8 @@ Buyer flow under test (no collateral, no `offer` / `bidding`):
 | 3 | `POST /users/lot-bidder-number` → `data.bidderNumber` |
 | 4 | WS `type=visitLot` |
 | 5 | WS `type=connected` |
-| 6 | Hold WebSocket (`WS_HOLD`, default `5m`) and reply `ping`/`pong` |
+| 6 | Hold WebSocket (`WS_HOLD`) and reply `ping`/`pong` |
+| 7 | Send `offer` then `bidding`, one at a time, wait notification before the next |
 
 Credentials come from in-file `BUYER_USER` array (not env `USERNAME`/`PASSWORD`).
 
@@ -130,6 +131,10 @@ Credentials come from in-file `BUYER_USER` array (not env `USERNAME`/`PASSWORD`)
 | `JOIN_SETTLE_MS` | no | `1000` | Settle wait after `connected` |
 | `WS_HOLD` / `WS_HOLD_MS` | no | `5m` | Keep WS open after join |
 | `LOG_WS_MSG` | no | `false` | Log inbound WS (except ping) |
+| `ACK` | no | `true` | Wait for offer/bid notification before sending again |
+| `STAGGER_MS` | no | `250` | VU n delay = `(n-1) * STAGGER_MS` when `ACK=true` |
+| `BID_AFTER_OFFER` | no | `true` | After offer success/`E5013`, switch to `bidding` |
+| `OFFER_INTERVAL_MS` | no | `1000` | Used only when `ACK=false` (sync fire) |
 | `REPORT_DIR` | no | `k6-reports` | Report root |
 | `REPORT_BASENAME` | no | `login-visit-connected` | JSON/HTML basename |
 | `REPORT_TITLE` | no | scenario title | HTML/JSON title base |
@@ -206,7 +211,8 @@ Generated files under `k6-reports/` are ignored by git (see `k6-reports/.gitigno
 
 ## Notes
 
-- This scenario does **not** call collateral or send bid (`offer` / `bidding`).
+- This scenario does **not** call collateral.
+- Default `ACK=true` waits for WS notification before the next offer/bid. Use `ACK=false` to reproduce lock contention (`E5002`).
 - Prefer `per-vu` + `ITERATIONS=1` + long `WS_HOLD` when the goal is “all buyers stay connected”.
 - Login `E2001` usually means wrong credentials / `loginType` for that environment — fix `BUYER_USER`.
 - Run `script.sh` from `k6-test/scripts/` so `REPORT_DIR=../k6-reports/...` resolves correctly.
