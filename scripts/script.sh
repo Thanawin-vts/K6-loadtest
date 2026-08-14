@@ -27,7 +27,8 @@ k6 run "$K6_SCRIPT" \
   -e WS_URL=wss://auctlive-sit.auct.co.th/api/v1/websocket \
   -e LOGIN_TYPE=buyer \
   -e REPORT_DIR="$REPORT_DIR" \
-  -e LOT_ID=975
+  -e LOT_ID=975 \
+  -e WS_HOLD_MS=20m
 
 END_TIME=$(TZ=Asia/Bangkok date +"%d/%m/%Y %H:%M:%S")
 END_EPOCH=$(date +%s)
