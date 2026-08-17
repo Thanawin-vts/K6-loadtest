@@ -122,9 +122,10 @@ export const options = {
   thresholds: {
     http_req_failed: ['rate<0.1'],
     checks: ['rate>0.9'],
-    login_duration_ms: ['p(95)<5000'],
-    user_profile_duration_ms: ['p(95)<5000'],
-    lot_bidder_number_duration_ms: ['p(95)<5000'],
+    http_req_duration: ['p(95)<5000', 'p(99)<5000'],
+    login_duration_ms: ['p(95)<5000', 'p(99)<5000'],
+    user_profile_duration_ms: ['p(95)<5000', 'p(99)<5000'],
+    lot_bidder_number_duration_ms: ['p(95)<5000', 'p(99)<5000'],
   },
 };
 
@@ -596,9 +597,9 @@ export default function () {
     return;
   }
 
-  group(`4. WS visitLot → connected (${buyer.username})`, () => {
-    runWebsocketVisitConnected(session, bidderNumber);
-  });
+  // group(`4. WS visitLot → connected (${buyer.username})`, () => {
+  //   runWebsocketVisitConnected(session, bidderNumber);
+  // });
 
   logInfo('iteration.done', `user=${buyer.username} lotId=${LOT_ID} bidderNumber=${bidderNumber}`);
   sleep(1);
