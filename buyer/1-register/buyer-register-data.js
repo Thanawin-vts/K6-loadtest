@@ -1,4 +1,4 @@
-export function buyerData(username, email, phone, idNo) {
+export function buyerData(username, email, phone, idNo, firstName, lastName) {
   return {
     actionBy: null,
     accountType: 12,
@@ -16,9 +16,9 @@ export function buyerData(username, email, phone, idNo) {
       labelEn: "Thailand",
     },
     prefixNameId: 21,
-    firstName: "โหลดเทสหนึ่ง",
+    firstName: firstName,
     middleName: null,
-    lastName: "บายเยอร์",
+    lastName: lastName,
     customerGroupId: 0,
     dateOfBirth: "1990-10-05",
     phoneCountryCode: "+66",

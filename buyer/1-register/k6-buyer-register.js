@@ -31,6 +31,11 @@ const BASE_URL = (__ENV.BASE_URL || 'https://auctlive-sit.auct.co.th/api/v1').re
 const COUNT = Math.max(1, Number(__ENV.COUNT || 1));
 const START = Math.max(1, Number(__ENV.START || 1));
 const VUS = Math.max(1, Number(__ENV.VUS || 1));
+const PREFIXUSER = (__ENV.PREFIXUSER || 'loadtestuser').replace(/\/$/, '');
+const PREFIXEMAIL = (__ENV.PREFIXEMAIL || 'loadtest').replace(/\/$/, '');
+const PREFIXPHONE = (__ENV.PREFIXPHONE || '09999').replace(/\/$/, '');
+const FIRSTNAME = (__ENV.FIRSTNAME || 'โหลดเทส').replace(/\/$/, '');
+const LASTNAME = (__ENV.LASTNAME || 'บายเยอร์').replace(/\/$/, '');
 
 export const options = {
   scenarios: {
@@ -51,7 +56,7 @@ export const handleSummary = createHandleSummary(() => ({
   titleBase: 'buyer register loop',
   reportDir: __ENV.REPORT_DIR || 'k6-reports',
   reportBasename: __ENV.REPORT_BASENAME || 'buyer-register',
-  meta: { baseUrl: BASE_URL, count: COUNT, start: START, vus: VUS },
+  meta: { baseUrl: BASE_URL, prefixUser: PREFIXUSER, prefixEmail: PREFIXEMAIL, prefixPhone: PREFIXPHONE, firstName: FIRSTNAME, lastName: LASTNAME, count: COUNT, start: START, vus: VUS },
 }));
 
 function pad(n, width) {
@@ -74,9 +79,11 @@ function isDuplicateId(res, parsed) {
 
 export default function () {
   const count = START + exec.scenario.iterationInTest;
-  const username = `loadtestuser${pad(count, 2)}`;
-  const email = `loadtest${pad(count, 2)}@gmail.com`;
-  const phone = `09999${pad(count, 5)}`;
+  const username = `${PREFIXUSER}${pad(count, 2)}`;
+  const email = `${PREFIXEMAIL}${pad(count, 2)}@gmail.com`;
+  const phone = `${PREFIXPHONE}${pad(count, 5)}`;
+  const firstName = `${FIRSTNAME}${pad(count, 2)}`;
+  const lastName = `${LASTNAME}${pad(count, 2)}`;
   const url = `${BASE_URL}/register/buyer/create`;
   const reqParams = {
     headers: { 'Content-Type': 'application/json' },
@@ -91,7 +98,7 @@ export default function () {
 
   while (true) {
     attempt += 1;
-    body = buyerData(username, email, phone, thaiIdGen());
+    body = buyerData(username, email, phone, thaiIdGen(), firstName, lastName);
     res = http.post(url, JSON.stringify(body), reqParams);
     createDuration.add(res.timings.duration);
     parsed = parseBody(res);
