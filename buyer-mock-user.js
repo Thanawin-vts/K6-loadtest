@@ -15,12 +15,11 @@ export function getMockBuyer(startLoopIndex, endLoopIndex, usernamePrefix) {
   const start = Math.max(1, Number(startLoopIndex != null ? startLoopIndex : 1));
   const end = Math.max(start, Number(endLoopIndex != null ? endLoopIndex : 100));
   const prefix = String(usernamePrefix != null ? usernamePrefix : 'loadtestuser');
-  const padWidth = Math.max(2, String(end).length);
 
   const buyers = [];
   for (let i = start; i <= end; i++) {
     let n = String(i);
-    while (n.length < padWidth) n = '0' + n;
+    while (n.length <= 1) n = '0' + n;
     buyers.push({
       username: prefix + n,
       password: 'P@ssw0rd',

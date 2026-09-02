@@ -371,42 +371,6 @@ function runWebsocketVisitConnected(session, bidderNumber) {
     url,
     { headers, tags: { name: 'WS visitLot + connected + hold', username: buyer.username } },
     function (socket) {
-      function sendOfferBid() {
-        if (failed || !holding) return;
-        const ts = nowIso();
-        const msg = buildWsMessage('offer', {
-          lots: [LOT_ID],
-          payload: {
-            action: OFFER_ACTION,
-            lotLineId: LOT_LINE_ID,
-            auctionNo: AUCTION_NO,
-            event: OFFER_EVENT,
-            bidderNumber: String(bidderNumber),
-          },
-        });
-        logInfo('ws.offer.send', `user=${buyer.username} ts=${ts} ${summarizeWsMessage(msg)}`);
-        socket.send(JSON.stringify(msg));
-        offerSent.add(1);
-      }
-
-      /** ส่ง offer ทุก OFFER_INTERVAL_MS แบบ sync ตามขอบวินาที wall-clock */
-      function startSyncedOfferLoop() {
-        if (OFFER_INTERVAL_MS <= 0) {
-          logInfo('ws.offer.skip', `user=${buyer.username} reason=OFFER_INTERVAL_MS<=0`);
-          return;
-        }
-        const firstWait = msUntilNextInterval(OFFER_INTERVAL_MS);
-        logInfo(
-          'ws.offer.loop.start',
-          `user=${buyer.username} intervalMs=${OFFER_INTERVAL_MS} firstWaitMs=${firstWait} — sync all VUs on wall-clock`
-        );
-        socket.setTimeout(function offerTick() {
-          if (failed || !holding) return;
-          sendOfferBid();
-          const nextWait = msUntilNextInterval(OFFER_INTERVAL_MS);
-          socket.setTimeout(offerTick, nextWait);
-        }, firstWait);
-      }
 
       socket.on('open', function () {
         logInfo('ws.open', `user=${buyer.username} status=connected`);

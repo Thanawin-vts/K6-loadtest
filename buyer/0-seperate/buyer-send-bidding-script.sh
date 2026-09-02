@@ -1,55 +1,49 @@
 #!/bin/bash
 #
+# Modular buyer bidding load test — uses buyer/0-seperate/ modules
+#
 # usage:
-#   ./buyer-visit-lot-script.sh [lotId] [wsHold] [startLoopIndex] [endLoopIndex] [usernamePrefix] [vus]
+#   ./buyer-send-bidding-script.sh [lotId] [lotLineId] [wsHold] [startLoopIndex] [endLoopIndex] [usernamePrefix] [vus] [biddingDelayMs]
 #
 # example:
-#   ./buyer-visit-lot-script.sh
-#   → LOT_ID=975, WS_HOLD=30m, buyers loadtestuser01 .. loadtestuser100
-#
-#   ./buyer-visit-lot-script.sh 975 5m
-#   → LOT_ID=975, WS_HOLD=5m, buyers loadtestuser01 .. loadtestuser100
-#
-#   ./buyer-visit-lot-script.sh 975 5m 1 10
-#   → buyers loadtestuser01 .. loadtestuser10
-#
-#   ./buyer-visit-lot-script.sh 975 10m 21 30 k6buyer
-#   → buyers k6buyer21 .. k6buyer30
-#
-#   ./buyer-visit-lot-script.sh 975 10m 1 50 loadtestuser 20
-#   → buyers loadtestuser01 .. loadtestuser50, VUS=20
+#   LOT_LINE_ID=<id> ./buyer-send-bidding-script.sh 975 <lotLineId> 5m 1 10
+#   ./buyer-send-bidding-script.sh 975 <lotLineId> 10m 1 50 loadtestuser 20 500
 #
 # Depends on:
-#   ./k6-buyer-visit-lot.js   # login → lot-bidder-number → WS visitLot → connected
-#   ../../buyer-mock-user.js  # getMockBuyer(start, end, prefix)
+#   ./k6-buyer-send-bidding.js
+#   ./lib/api-functions.js
+#   ./lib/websocket-functions.js
+#   ../../buyer-mock-user.js
 #   ../../lib/k6-report.js
 #
 
 set -e
 
-if [ "$#" -gt 6 ]; then
-  echo "usage: $0 [lotId] [wsHold] [startLoopIndex] [endLoopIndex] [usernamePrefix] [vus]"
-  echo "example: $0"
-  echo "example: $0 975 5m"
-  echo "example: $0 975 5m 1 10"
-  echo "example: $0 975 10m 21 30 k6buyer"
-  echo "example: $0 975 10m 1 50 loadtestuser 20"
+if [ "$#" -gt 8 ]; then
+  echo "usage: $0 [lotId] [lotLineId] [wsHold] [startLoopIndex] [endLoopIndex] [usernamePrefix] [vus] [biddingDelayMs]"
   exit 1
 fi
 
 LOT_ID="${1:-975}"
-WS_HOLD="${2:-30m}"
-START_LOOP_INDEX="${3:-1}"
-END_LOOP_INDEX="${4:-100}"
-USERNAME_PREFIX="${5:-loadtestuser}"
-VUS="${6:-}"
+LOT_LINE_ID="${2:-${LOT_LINE_ID:-}}"
+WS_HOLD="${3:-30m}"
+START_LOOP_INDEX="${4:-1}"
+END_LOOP_INDEX="${5:-100}"
+USERNAME_PREFIX="${6:-loadtestuser}"
+VUS="${7:-}"
+BIDDING_DELAY_MS="${8:-${BIDDING_DELAY_MS:-}}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-K6_SCRIPT="${SCRIPT_DIR}/k6-buyer-visit-lot.js"
+K6_SCRIPT="${SCRIPT_DIR}/k6-buyer-send-bidding.js"
 
 if [ ! -f "$K6_SCRIPT" ]; then
   echo "file not found: $K6_SCRIPT"
+  exit 1
+fi
+
+if [ -z "$LOT_LINE_ID" ]; then
+  echo "LOT_LINE_ID is required (arg2 or env LOT_LINE_ID=...)"
   exit 1
 fi
 
@@ -73,6 +67,11 @@ if [ -n "$VUS" ] && ! [[ "$VUS" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+if [ -n "$BIDDING_DELAY_MS" ] && ! [[ "$BIDDING_DELAY_MS" =~ ^[0-9]+$ ]]; then
+  echo "biddingDelayMs must be a non-negative integer (ms), got: $BIDDING_DELAY_MS"
+  exit 1
+fi
+
 TIMESTAMP=$(TZ=Asia/Bangkok date +"%Y%m%d/%H%M%S")
 FILE_STAMP=$(echo "$TIMESTAMP" | tr '/' '-')
 REPORT_DIR="${REPO_ROOT}/k6-reports/${TIMESTAMP}"
@@ -86,8 +85,10 @@ START_EPOCH=$(date +%s)
 
 BUYER_COUNT=$((END_LOOP_INDEX - START_LOOP_INDEX + 1))
 
-echo "script          : $K6_SCRIPT"
+echo "script          : $K6_SCRIPT (modular)"
 echo "lotId           : $LOT_ID"
+echo "lotLineId       : $LOT_LINE_ID"
+echo "auctionNo       : ${AUCTION_NO:-1}"
 echo "wsHold          : $WS_HOLD"
 echo "startLoopIndex  : $START_LOOP_INDEX"
 echo "endLoopIndex    : $END_LOOP_INDEX"
@@ -98,6 +99,12 @@ if [ -n "$VUS" ]; then
 else
   echo "vus             : (default = BUYER_USER.length = $BUYER_COUNT)"
 fi
+echo "ack             : ${ACK:-true}"
+if [ -n "$BIDDING_DELAY_MS" ]; then
+  echo "biddingDelayMs  : $BIDDING_DELAY_MS"
+else
+  echo "biddingDelayMs  : (default = 0)"
+fi
 echo "report dir      : $REPORT_DIR"
 echo "Start Date Time : $START_TIME"
 echo ""
@@ -107,13 +114,19 @@ K6_ARGS=(
   -e "WS_URL=${WS_URL:-wss://auctlive-sit.auct.co.th/api/v1/websocket}"
   -e "LOGIN_TYPE=buyer"
   -e "LOT_ID=${LOT_ID}"
+  -e "LOT_LINE_ID=${LOT_LINE_ID}"
+  -e "AUCTION_NO=${AUCTION_NO:-1}"
+  -e "BIDDING_EVENT=${BIDDING_EVENT:-online}"
+  -e "BIDDING_ACTION=${BIDDING_ACTION:-bid}"
+  -e "BIDDING=${BIDDING:-true}"
+  -e "ACK=${ACK:-true}"
   -e "WS_HOLD=${WS_HOLD}"
   -e "START_LOOP_INDEX=${START_LOOP_INDEX}"
   -e "END_LOOP_INDEX=${END_LOOP_INDEX}"
   -e "USERNAME_PREFIX=${USERNAME_PREFIX}"
   -e "REPORT_DIR=${REPORT_DIR}"
-  -e "REPORT_BASENAME=buyer-lot-connected"
-  -e "REPORT_TITLE=buyer visitLot → connected"
+  -e "REPORT_BASENAME=buyer-send-bidding-separate"
+  -e "REPORT_TITLE=buyer visitLot → bidding (modular)"
 )
 
 if [ -n "$VUS" ]; then
@@ -132,6 +145,30 @@ if [ -n "${LOG_WS_MSG:-}" ]; then
   K6_ARGS+=(-e "LOG_WS_MSG=${LOG_WS_MSG}")
 fi
 
+if [ -n "${STAGGER_MS:-}" ]; then
+  K6_ARGS+=(-e "STAGGER_MS=${STAGGER_MS}")
+fi
+
+if [ -n "${ACK_TIMEOUT_MS:-}" ]; then
+  K6_ARGS+=(-e "ACK_TIMEOUT_MS=${ACK_TIMEOUT_MS}")
+fi
+
+if [ -n "${ACK_RETRY_MS:-}" ]; then
+  K6_ARGS+=(-e "ACK_RETRY_MS=${ACK_RETRY_MS}")
+fi
+
+if [ -n "${ACK_COOLDOWN_MS:-}" ]; then
+  K6_ARGS+=(-e "ACK_COOLDOWN_MS=${ACK_COOLDOWN_MS}")
+fi
+
+if [ -n "${BIDDING_INTERVAL_MS:-}" ]; then
+  K6_ARGS+=(-e "BIDDING_INTERVAL_MS=${BIDDING_INTERVAL_MS}")
+fi
+
+if [ -n "${BIDDING_DELAY_MS:-}" ]; then
+  K6_ARGS+=(-e "BIDDING_DELAY_MS=${BIDDING_DELAY_MS}")
+fi
+
 k6 run "$K6_SCRIPT" "${K6_ARGS[@]}"
 
 END_TIME=$(TZ=Asia/Bangkok date +"%d/%m/%Y %H:%M:%S")
@@ -148,11 +185,13 @@ DURATION_FORMAT=$(printf "%02d:%02d:%02d" \
   "$SECONDS")
 
 cat > "$TIMESTAMP_FILE" <<EOF
-Test Execution
+Test Execution (modular)
 ==================================================
 File Name       : $FILE_NAME_LABEL
-Scenario        : buyer visitLot → connected
+Scenario        : buyer visitLot → bidding (modular)
 Lot ID          : $LOT_ID
+Lot Line ID     : $LOT_LINE_ID
+Auction No      : ${AUCTION_NO:-1}
 WS Hold         : $WS_HOLD
 Start Index     : $START_LOOP_INDEX
 End Index       : $END_LOOP_INDEX
@@ -168,4 +207,4 @@ echo ""
 cat "$TIMESTAMP_FILE"
 echo ""
 echo "Timestamp saved to: $TIMESTAMP_FILE"
-echo "Reports: ${REPORT_DIR}/buyer-lot-connected.{json,html}"
+echo "Reports: ${REPORT_DIR}/buyer-send-bidding-separate.{json,html}"

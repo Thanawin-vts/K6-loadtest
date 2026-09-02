@@ -1,17 +1,15 @@
 /**
- * k6 — login → lot-bidder-number → WS visitLot → WS connected → WS offer
+ * k6 — login → [setup: lot-bidder-number ทีละ user] → WS visitLot → connected → offer
  *
  * BUYER_USER = array ของ buyer (จาก getMockBuyer)
  * Default: เปิด VU พร้อมกัน = จำนวน buyer (1 VU : 1 user) แล้วแต่ละ VU รันครบทุก action
  *
- * บริบท: ทุก buyer connect แล้วค้าง WebSocket แล้วส่ง offer ซ้ำจนหมด WS_HOLD
- * Default: ACK=true + STAGGER — ยิงทีละข้อความ รอ notification ก่อนยิงต่อ และ offset ตาม VU
- * BID_AFTER_OFFER=true: หลัง offer สำเร็จ/E5013 สลับเป็น bidding
- * ACK=false: โหมดเดิม ทุก VU ส่ง offer พร้อมกันตาม wall-clock (ใช้ทดสอบ lock / E5002)
+ * บริบท: buffer script — lot-bidder-number ถูกเตรียมใน setup() ทีละ user (ไม่ยิงพร้อมกัน)
+ *        phase หลัก: login + WS offer ยังรันพร้อมกันตาม VU
  *
  * รันตัวอย่าง (stagger + รอ ack):
- *   ./buyer-send-offer-script.sh 975 10360 5m 1 10 loadtestuser 10
- *   k6 run buyer/5-offer-ws/k6-buyer-send-offer.js \
+ *   ./buyer-send-offer-buffer-script.sh 975 10360 1 5m 1 10 loadtestuser 10
+ *   k6 run buyer/5-offer-ws/k6-buyer-send-offer-buffer.js \
  *     -e BASE_URL=https://auctlive-sit.auct.co.th/api/v1 \
  *     -e WS_URL=wss://auctlive-sit.auct.co.th/api/v1/websocket \
  *     -e LOT_ID=975 \
@@ -42,12 +40,14 @@
  *   ACK_COOLDOWN_MS=800 # รอหลังสำเร็จ ก่อนยิง offer/bidding รอบถัดไป
  *   BID_AFTER_OFFER=false # true = หลัง offer สำเร็จหรือ E5013 สลับเป็น bidding
  *   OFFER_INTERVAL_MS=1000  # ใช้เมื่อ ACK=false เท่านั้น
- *   HTTP_STAGGER_MS=250   # offset ก่อน lot-bidder-number ต่อ VU (default = STAGGER_MS)
- *   LOT_BIDDER_RETRIES=3  # retry lot-bidder-number เมื่อ fail/timeout
+ *   LOT_BIDDER_GAP_MS=0     # รอระหว่าง user ใน setup (lot-bidder-number ทีละคน)
+ *   LOT_BIDDER_RETRIES=3    # retry lot-bidder-number ใน setup เมื่อ fail/timeout
  *   LOT_BIDDER_RETRY_MS=500
+ *   HTTP_TIMEOUT_MS=15000
+ *   SETUP_TIMEOUT=30m       # override k6 setup() limit (default 0 = 24h, ไม่ timeout ระหว่าง test)
  *   LOG_WS_MSG=true
  *   REPORT_DIR=k6-reports
- *   REPORT_BASENAME=buyer-send-offer
+ *   REPORT_BASENAME=buyer-send-offer-buffer
  *   # output → k6-reports/yyyyMMdd/HH-mm-ss/*.json|html
  *   # หรือกำหนด path เต็มด้วย REPORT_JSON / REPORT_HTML
  */
@@ -72,6 +72,8 @@ const biddingSent = new Counter('ws_bidding_sent');
 const ackOk = new Counter('ws_ack_ok');
 const ackRetry = new Counter('ws_ack_retry');
 const ackTimeout = new Counter('ws_ack_timeout');
+const lotBidderPrepareOk = new Counter('lot_bidder_prepare_ok');
+const lotBidderPrepareFail = new Counter('lot_bidder_prepare_fail');
 
 const START_LOOP_INDEX = Math.max(1, Number(__ENV.START_LOOP_INDEX || 1));
 const END_LOOP_INDEX = Math.max(START_LOOP_INDEX, Number(__ENV.END_LOOP_INDEX || 100));
@@ -111,10 +113,30 @@ const ACK_TIMEOUT_MS = Number(__ENV.ACK_TIMEOUT_MS || 2000);
 const ACK_RETRY_MS = Number(__ENV.ACK_RETRY_MS || 400);
 const ACK_COOLDOWN_MS = Number(__ENV.ACK_COOLDOWN_MS || 800);
 const ACK_TICK_MS = Number(__ENV.ACK_TICK_MS || 50);
-const HTTP_STAGGER_MS = Number(__ENV.HTTP_STAGGER_MS || STAGGER_MS);
+const LOT_BIDDER_GAP_MS = Number(__ENV.LOT_BIDDER_GAP_MS || 0);
 const LOT_BIDDER_RETRIES = Number(__ENV.LOT_BIDDER_RETRIES || 3);
 const LOT_BIDDER_RETRY_MS = Number(__ENV.LOT_BIDDER_RETRY_MS || 500);
 const HTTP_TIMEOUT_MS = Number(__ENV.HTTP_TIMEOUT_MS || 15000);
+
+function msToDuration(ms) {
+  const n = Math.max(1, Math.ceil(Number(ms) || 0));
+  if (n >= 3600000 && n % 3600000 === 0) return `${n / 3600000}h`;
+  if (n >= 60000 && n % 60000 === 0) return `${n / 60000}m`;
+  if (n >= 1000 && n % 1000 === 0) return `${n / 1000}s`;
+  return `${n}ms`;
+}
+
+const SETUP_UNLIMITED_MS = 24 * 60 * 60 * 1000;
+
+function resolveSetupTimeout() {
+  const raw = String(__ENV.SETUP_TIMEOUT || __ENV.SETUP_TIMEOUT_MS || '0').trim();
+  if (['0', '0s', '0ms', 'unlimited', 'none', 'inf', 'infinite'].includes(raw.toLowerCase())) {
+    return '24h';
+  }
+  return msToDuration(parseDurationMs(raw, SETUP_UNLIMITED_MS));
+}
+
+const SETUP_TIMEOUT = resolveSetupTimeout();
 
 function parseDurationMs(value, fallbackMs) {
   if (value == null || value === '') return fallbackMs;
@@ -141,9 +163,78 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function vuContext() {
+  return {
+    vu: typeof __VU !== 'undefined' ? __VU : 'setup',
+    iter: typeof __ITER !== 'undefined' ? __ITER : '-',
+  };
+}
+
+function vuTag() {
+  const { vu, iter } = vuContext();
+  return `[vu=${vu} iter=${iter}]`;
+}
+
 function logInfo(action, detail) {
   const extra = detail ? ` | ${detail}` : '';
-  console.log(`[INFO][vu=${__VU} iter=${__ITER}] ${action}${extra}`);
+  console.log(`[INFO]${vuTag()} ${action}${extra}`);
+}
+
+function logError(action, detail) {
+  const extra = detail ? ` | ${detail}` : '';
+  console.error(`[ERROR]${vuTag()} ${action}${extra}`);
+}
+
+function formatHttpError(res, body) {
+  const parts = [];
+  if (res) parts.push(`status=${res.status}`);
+  if (body && body.code) parts.push(`code=${body.code}`);
+  if (body && body.message) parts.push(`message=${body.message}`);
+  return parts.join(' ');
+}
+
+function describeWsNotification(msg) {
+  if (!msg || typeof msg !== 'object') return `raw=${String(msg).slice(0, 120)}`;
+  const payload = msg.payload || {};
+  const parts = [
+    `type=${msg.type || '-'}`,
+    payload.code ? `code=${payload.code}` : null,
+    payload.level ? `level=${payload.level}` : null,
+    payload.message ? `message=${payload.message}` : null,
+  ].filter(Boolean);
+  return parts.join(' ');
+}
+
+const SETUP_LOG_WIDTH = 72;
+
+function logSetupDivider(title) {
+  if (!title) {
+    console.log(`[SETUP] ${'═'.repeat(SETUP_LOG_WIDTH)}`);
+    return;
+  }
+  const label = ` ${title} `;
+  const pad = Math.max(0, SETUP_LOG_WIDTH - label.length);
+  const left = Math.floor(pad / 2);
+  const right = pad - left;
+  console.log(`[SETUP] ${'═'.repeat(left)}${label}${'═'.repeat(right)}`);
+}
+
+function logSetupRule() {
+  console.log(`[SETUP] ${'─'.repeat(SETUP_LOG_WIDTH)}`);
+}
+
+function logSetup(action, detail, meta) {
+  const m = meta || {};
+  const tags = [];
+  if (m.round) tags.push(m.round);
+  if (m.phase) tags.push(m.phase);
+  if (m.attempt != null && m.maxAttempts != null) {
+    tags.push(`attempt ${m.attempt}/${m.maxAttempts}`);
+  }
+  if (m.status) tags.push(m.status);
+  const tagStr = tags.length ? `[${tags.join('][')}] ` : '';
+  const extra = detail ? ` | ${detail}` : '';
+  console.log(`[SETUP] ${tagStr}${action}${extra}`);
 }
 
 function maskToken(value) {
@@ -173,6 +264,7 @@ function buildScenario() {
 }
 
 export const options = {
+  setupTimeout: SETUP_TIMEOUT,
   scenarios: {
     login_visit_connected: buildScenario(),
   },
@@ -270,8 +362,21 @@ function authHeaders(accessToken, serviceName, buyer) {
   return headers;
 }
 
-function login(buyer) {
-  logInfo('login.start', `POST ${BASE_URL}/auth/login username=${buyer.username} loginType=${buyer.loginType}`);
+function login(buyer, opts) {
+  const o = opts || {};
+  const log = o.log || logInfo;
+  const setupMeta = o.setupMeta || null;
+  const logStep = function (action, detail, meta) {
+    if (setupMeta) {
+      logSetup(action, detail, Object.assign({}, setupMeta, meta || {}));
+      return;
+    }
+    log(action, detail);
+  };
+
+  logStep('login.start', `POST ${BASE_URL}/auth/login username=${buyer.username} loginType=${buyer.loginType}`, {
+    phase: 'LOGIN',
+  });
   const res = http.post(
     `${BASE_URL}/auth/login`,
     JSON.stringify({
@@ -297,34 +402,54 @@ function login(buyer) {
     'login has entryKey': () => !!data.entryKey,
   });
   if (!ok) {
-    console.error(
-      `[ERROR][vu=${__VU} iter=${__ITER}] login.fail user=${buyer.username} status=${res.status} code=${body && body.code} message=${body && body.message} durationMs=${res.timings.duration} body=${res.body}`
-    );
+    const errDetail = formatHttpError(res, body);
+    logError('login.fail', `user=${buyer.username} ${errDetail} durationMs=${res.timings.duration} body=${res.body}`);
     console.error(
       `[ERROR] hint: E2001 = user not found for username="${buyer.username}" loginType="${buyer.loginType}" on ${BASE_URL}`
     );
-    return null;
+    if (setupMeta) {
+      logSetup('login.fail', `username=${buyer.username} ${errDetail}`, Object.assign({}, setupMeta, { phase: 'LOGIN', status: 'FAIL' }));
+    }
+    return {
+      session: null,
+      error: {
+        step: 'login',
+        username: buyer.username,
+        status: res.status,
+        code: body && body.code,
+        message: body && body.message,
+      },
+    };
   }
 
-  logInfo(
+  logStep(
     'login.ok',
-    `user=${buyer.username} status=${res.status} durationMs=${res.timings.duration.toFixed(1)} entryKey=${maskToken(data.entryKey)} sessionId=${maskToken(data.sessionId)} accessToken=${maskToken(data.accessToken)}`
+    `username=${buyer.username} status=${res.status} durationMs=${res.timings.duration.toFixed(1)} entryKey=${maskToken(data.entryKey)} sessionId=${maskToken(data.sessionId)} accessToken=${maskToken(data.accessToken)}`,
+    { phase: 'LOGIN', status: 'OK' }
   );
 
   return {
-    accessToken: data.accessToken,
-    entryKey: data.entryKey,
-    sessionId: data.sessionId || '',
-    buyer,
+    session: {
+      accessToken: data.accessToken,
+      entryKey: data.entryKey,
+      sessionId: data.sessionId || '',
+      buyer,
+    },
+    error: null,
   };
 }
 
-function getLotBidderNumber(session) {
+function getLotBidderNumber(session, options) {
+  const opts = options || {};
   const user = session.buyer.username;
-  const staggerMs = Math.max(0, (__VU - 1) * HTTP_STAGGER_MS);
-  if (staggerMs > 0) {
-    logInfo('lot-bidder-number.stagger', `user=${user} waitMs=${staggerMs}`);
-    sleep(staggerMs / 1000);
+  const sequential = opts.sequential === true;
+  const recordChecks = opts.recordChecks !== false;
+  const setupMeta = opts.setupMeta || null;
+
+  if (!sequential) {
+    console.warn(
+      `[WARN]${vuTag()} lot-bidder-number called outside setup — buffer script expects setup() prep`
+    );
   }
 
   let lastRes = null;
@@ -332,16 +457,48 @@ function getLotBidderNumber(session) {
   let bidderNumber = '';
 
   for (let attempt = 1; attempt <= LOT_BIDDER_RETRIES; attempt++) {
-    logInfo(
-      'lot-bidder-number.start',
-      `POST ${BASE_URL}/users/lot-bidder-number user=${user} lotId=${LOT_ID} attempt=${attempt}/${LOT_BIDDER_RETRIES}`
-    );
+    const attemptMeta = {
+      phase: 'LOT-BIDDER',
+      attempt: attempt,
+      maxAttempts: LOT_BIDDER_RETRIES,
+    };
+    if (attempt > 1) {
+      if (setupMeta) {
+        logSetupRule();
+        logSetup(
+          'lot-bidder-number.retry',
+          `username=${user} lotId=${LOT_ID} waitingMs=${LOT_BIDDER_RETRY_MS}`,
+          Object.assign({}, setupMeta, attemptMeta, { status: 'RETRY' })
+        );
+      } else {
+        logInfo(
+          'lot-bidder-number.retry',
+          `user=${user} lotId=${LOT_ID} attempt=${attempt}/${LOT_BIDDER_RETRIES} waitingMs=${LOT_BIDDER_RETRY_MS}`
+        );
+      }
+    }
+
+    if (setupMeta) {
+      logSetup(
+        'lot-bidder-number.start',
+        `POST ${BASE_URL}/users/lot-bidder-number username=${user} lotId=${LOT_ID}`,
+        Object.assign({}, setupMeta, attemptMeta)
+      );
+    } else {
+      logInfo(
+        'lot-bidder-number.start',
+        `POST ${BASE_URL}/users/lot-bidder-number user=${user} lotId=${LOT_ID} attempt=${attempt}/${LOT_BIDDER_RETRIES}`
+      );
+    }
     const res = http.post(
       `${BASE_URL}/users/lot-bidder-number`,
       JSON.stringify({ lotId: Number(LOT_ID) }),
       {
         headers: authHeaders(session.accessToken, 'user-service', session.buyer),
-        tags: { name: 'POST /users/lot-bidder-number', username: user },
+        tags: {
+          name: sequential ? 'SETUP POST /users/lot-bidder-number' : 'POST /users/lot-bidder-number',
+          username: user,
+        },
         timeout: `${HTTP_TIMEOUT_MS}ms`,
       }
     );
@@ -350,35 +507,149 @@ function getLotBidderNumber(session) {
     const data = lastBody && lastBody.data ? lastBody.data : null;
     bidderNumber = data && data.bidderNumber != null ? String(data.bidderNumber) : '';
 
-    const ok =
-      res.status === 200 &&
-      bidderNumber !== '';
+    const ok = res.status === 200 && bidderNumber !== '';
     if (ok) {
       bidderDuration.add(res.timings.duration);
-      check(res, {
-        'lot-bidder-number status 200': (r) => r.status === 200,
-        'lot-bidder-number has bidderNumber': () => bidderNumber !== '',
-      });
-      logInfo(
-        'lot-bidder-number.ok',
-        `user=${user} lotId=${LOT_ID} bidderNumber=${bidderNumber} status=${res.status} durationMs=${res.timings.duration.toFixed(1)} attempt=${attempt}`
-      );
+      if (recordChecks) {
+        check(res, {
+          'lot-bidder-number status 200': (r) => r.status === 200,
+          'lot-bidder-number has bidderNumber': () => bidderNumber !== '',
+        });
+      }
+      if (setupMeta) {
+        logSetup(
+          'lot-bidder-number.ok',
+          `username=${user} lotId=${LOT_ID} bidderNumber=${bidderNumber} status=${res.status} durationMs=${res.timings.duration.toFixed(1)}`,
+          Object.assign({}, setupMeta, attemptMeta, { status: 'OK' })
+        );
+      } else {
+        logInfo(
+          'lot-bidder-number.ok',
+          `user=${user} lotId=${LOT_ID} bidderNumber=${bidderNumber} status=${res.status} durationMs=${res.timings.duration.toFixed(1)} attempt=${attempt}`
+        );
+      }
       return bidderNumber;
     }
 
-    console.error(
-      `[ERROR][vu=${__VU} iter=${__ITER}] lot-bidder-number.fail user=${user} lotId=${LOT_ID} attempt=${attempt}/${LOT_BIDDER_RETRIES} status=${res.status} code=${lastBody && lastBody.code} durationMs=${res.timings.duration} body=${res.body}`
-    );
+    if (setupMeta) {
+      logSetup(
+        'lot-bidder-number.fail',
+        `username=${user} lotId=${LOT_ID} status=${res.status} code=${lastBody && lastBody.code} durationMs=${res.timings.duration.toFixed(1)}`,
+        Object.assign({}, setupMeta, attemptMeta, { status: 'FAIL' })
+      );
+    } else {
+      console.error(
+        `[ERROR] lot-bidder-number.fail user=${user} lotId=${LOT_ID} attempt=${attempt}/${LOT_BIDDER_RETRIES} status=${res.status} code=${lastBody && lastBody.code} durationMs=${res.timings.duration} body=${res.body}`
+      );
+    }
     if (attempt < LOT_BIDDER_RETRIES) {
       sleep(LOT_BIDDER_RETRY_MS / 1000);
     }
   }
 
-  check(lastRes, {
-    'lot-bidder-number status 200': (r) => r && r.status === 200,
-    'lot-bidder-number has bidderNumber': () => bidderNumber !== '',
-  });
+  if (recordChecks) {
+    check(lastRes, {
+      'lot-bidder-number status 200': (r) => r && r.status === 200,
+      'lot-bidder-number has bidderNumber': () => bidderNumber !== '',
+    });
+  }
   return '';
+}
+
+function prepareLotBidderNumbers() {
+  const preparedByUsername = {};
+  const failedUsernames = [];
+  const total = BUYER_USER.length;
+
+  logSetupDivider('lot-bidder-number batch START');
+  logSetup('batch.config', `buyers=${total} lotId=${LOT_ID} gapMs=${LOT_BIDDER_GAP_MS} retries=${LOT_BIDDER_RETRIES} httpTimeoutMs=${HTTP_TIMEOUT_MS}`, {
+    phase: 'CONFIG',
+  });
+  logSetupRule();
+
+  for (let i = 0; i < total; i++) {
+    const buyer = BUYER_USER[i];
+    const round = `${i + 1}/${total}`;
+    const setupMeta = { round: round };
+
+    logSetupDivider(`BUYER ${round} — ${buyer.username}`);
+
+    const loginResult = login(buyer, { setupMeta: setupMeta });
+    if (!loginResult.session) {
+      const err = loginResult.error || {};
+      failedUsernames.push(buyer.username);
+      lotBidderPrepareFail.add(1);
+      logSetup(
+        'batch.user.result',
+        `username=${buyer.username} reason=login_failed step=${err.step || 'login'} code=${err.code || '-'} message=${err.message || '-'}`,
+        {
+          round: round,
+          phase: 'RESULT',
+          status: 'FAIL',
+        }
+      );
+      logSetupRule();
+      continue;
+    }
+
+    const session = loginResult.session;
+    const bidderNumber = getLotBidderNumber(session, {
+      sequential: true,
+      recordChecks: true,
+      setupMeta: setupMeta,
+    });
+    if (!bidderNumber) {
+      failedUsernames.push(buyer.username);
+      lotBidderPrepareFail.add(1);
+      logSetup('batch.user.result', `username=${buyer.username} reason=lot_bidder_failed`, {
+        round: round,
+        phase: 'RESULT',
+        status: 'FAIL',
+      });
+      logSetupRule();
+      continue;
+    }
+
+    preparedByUsername[buyer.username] = {
+      idx: i,
+      username: buyer.username,
+      bidderNumber: bidderNumber,
+    };
+    lotBidderPrepareOk.add(1);
+    logSetup('batch.user.result', `username=${buyer.username} bidderNumber=${bidderNumber}`, {
+      round: round,
+      phase: 'RESULT',
+      status: 'OK',
+    });
+    logSetupRule();
+
+    if (LOT_BIDDER_GAP_MS > 0 && i < total - 1) {
+      logSetup('batch.gap', `waitingMs=${LOT_BIDDER_GAP_MS} before next buyer`, { round: round, phase: 'GAP' });
+      sleep(LOT_BIDDER_GAP_MS / 1000);
+    }
+  }
+
+  logSetupDivider('lot-bidder-number batch DONE');
+  logSetup(
+    'batch.summary',
+    `ok=${Object.keys(preparedByUsername).length} fail=${failedUsernames.length} total=${total}`,
+    { phase: 'SUMMARY', status: failedUsernames.length > 0 ? 'PARTIAL' : 'OK' }
+  );
+
+  if (failedUsernames.length > 0) {
+    console.error(`[ERROR][SETUP] lot-bidder-number failed users: ${failedUsernames.join(', ')}`);
+  }
+
+  return {
+    preparedByUsername: preparedByUsername,
+    preparedCount: Object.keys(preparedByUsername).length,
+    failedUsernames: failedUsernames,
+  };
+}
+
+export function setup() {
+  requireEnv();
+  return prepareLotBidderNumbers();
 }
 
 function isJoinError(msg) {
@@ -563,6 +834,7 @@ function runWebsocketVisitConnected(session, bidderNumber) {
   let connectedDone = false;
   let failed = false;
   let holding = false;
+  let lastError = null;
   const ack = {
     pending: false,
     phase: 'offer',
@@ -842,8 +1114,18 @@ function runWebsocketVisitConnected(session, bidderNumber) {
           connectedDone = true;
           connectedFail.add(1);
           check(null, { 'ws connected settled': () => false });
-          console.error(
-            `[ERROR][vu=${__VU} iter=${__ITER}] ws.connected.fail user=${buyer.username} lotId=${LOT_ID} msg=${raw}`
+          const payload = msg.payload || {};
+          lastError = {
+            step: 'ws_offer',
+            reason: 'join_notification_error',
+            code: payload.code || '',
+            level: payload.level || '',
+            message: payload.message || '',
+            detail: describeWsNotification(msg),
+          };
+          logError(
+            'ws.connected.fail',
+            `user=${buyer.username} lotId=${LOT_ID} ${lastError.detail} msg=${raw}`
           );
           socket.close();
         } else if (holding && isJoinError(msg)) {
@@ -851,14 +1133,20 @@ function runWebsocketVisitConnected(session, bidderNumber) {
           if (ACK_ENABLED && isAckExpectedError(code)) {
             return;
           }
-          console.error(
-            `[ERROR][vu=${__VU} iter=${__ITER}] ws.hold.notification_error user=${buyer.username} lotId=${LOT_ID} msg=${raw}`
+          logError(
+            'ws.hold.notification_error',
+            `user=${buyer.username} lotId=${LOT_ID} ${describeWsNotification(msg)} msg=${raw}`
           );
         }
       });
 
       socket.on('error', function (e) {
-        console.error(`[ERROR][vu=${__VU} iter=${__ITER}] ws.socket.error user=${buyer.username}: ${e}`);
+        lastError = {
+          step: 'ws_offer',
+          reason: 'socket_error',
+          message: String(e),
+        };
+        logError('ws.socket.error', `user=${buyer.username} error=${e}`);
       });
 
       socket.on('close', function () {
@@ -870,8 +1158,14 @@ function runWebsocketVisitConnected(session, bidderNumber) {
         failed = true;
         connectedFail.add(1);
         check(null, { 'ws connected within timeout': () => false });
-        console.error(
-          `[ERROR][vu=${__VU} iter=${__ITER}] ws.join.timeout user=${buyer.username} lotId=${LOT_ID} timeoutMs=${WS_TIMEOUT_MS}`
+        lastError = {
+          step: 'ws_offer',
+          reason: 'join_timeout',
+          timeoutMs: WS_TIMEOUT_MS,
+        };
+        logError(
+          'ws.join.timeout',
+          `user=${buyer.username} lotId=${LOT_ID} timeoutMs=${WS_TIMEOUT_MS}`
         );
         socket.close();
       }, WS_TIMEOUT_MS);
@@ -888,41 +1182,115 @@ function runWebsocketVisitConnected(session, bidderNumber) {
     upgraded ? 'ws.session.done' : 'ws.session.fail',
     `user=${buyer.username} httpStatus=${res && res.status} durationMs=${elapsed} holdMs=${WS_HOLD_MS}`
   );
+
+  if (!upgraded) {
+    return {
+      ok: false,
+      error: {
+        step: 'ws_offer',
+        reason: 'ws_upgrade_failed',
+        httpStatus: res && res.status,
+      },
+    };
+  }
+  if (failed && lastError) {
+    return { ok: false, error: lastError };
+  }
+  if (failed) {
+    return {
+      ok: false,
+      error: { step: 'ws_offer', reason: 'unknown' },
+    };
+  }
+  return { ok: true, error: null };
 }
 
-export default function () {
+export default function (setupData) {
   requireEnv();
 
   logInfo(
     'iteration.start',
-    `baseUrl=${BASE_URL} wsUrl=${WS_URL} lotId=${LOT_ID} lotLineId=${LOT_LINE_ID} auctionNo=${AUCTION_NO} buyerCount=${BUYER_USER.length} vus=${VUS} executor=${EXECUTOR} userPick=${USER_PICK} ack=${ACK_ENABLED} staggerMs=${STAGGER_MS}`
+    `baseUrl=${BASE_URL} wsUrl=${WS_URL} lotId=${LOT_ID} lotLineId=${LOT_LINE_ID} auctionNo=${AUCTION_NO} buyerCount=${BUYER_USER.length} vus=${VUS} executor=${EXECUTOR} userPick=${USER_PICK} ack=${ACK_ENABLED} staggerMs=${STAGGER_MS} prepared=${setupData && setupData.preparedCount}`
   );
 
   const { buyer, idx } = pickBuyer();
+  const prepared =
+    setupData && setupData.preparedByUsername ? setupData.preparedByUsername[buyer.username] : null;
+
+  if (!prepared || !prepared.bidderNumber) {
+    fail(
+      `ไม่มี prepared lot-bidder-number สำหรับ user=${buyer.username} — ตรวจ setup log (failed=${setupData && setupData.failedUsernames ? setupData.failedUsernames.join(',') : '-'})`
+    );
+  }
+
   let session;
-  let bidderNumber = '';
+  let loginError = null;
+  const bidderNumber = prepared.bidderNumber;
 
   group(`1. login (${buyer.username} #${idx})`, () => {
-    session = login(buyer);
+    const loginResult = login(buyer);
+    session = loginResult.session;
+    loginError = loginResult.error;
   });
   if (!session) {
-    logInfo('iteration.abort', `reason=login_failed user=${buyer.username}`);
+    const err = loginError || {};
+    logError(
+      'iteration.abort',
+      `step=${err.step || 'login'} reason=login_failed user=${buyer.username} status=${err.status || '-'} code=${err.code || '-'} message=${err.message || '-'}`
+    );
     sleep(1);
     return;
   }
 
-  group(`2. POST /users/lot-bidder-number (${buyer.username})`, () => {
-    bidderNumber = getLotBidderNumber(session);
+  group(`2. lot-bidder-number prepared (${buyer.username})`, () => {
+    const preparedOk = bidderNumber !== '';
+    const userMatch = prepared.username === buyer.username;
+    if (!preparedOk) {
+      logError(
+        'lot-bidder-number.prepared_fail',
+        `user=${buyer.username} reason=empty_bidder_number lotId=${LOT_ID} source=setup`
+      );
+    }
+    if (!userMatch) {
+      logError(
+        'lot-bidder-number.prepared_fail',
+        `user=${buyer.username} reason=username_mismatch expected=${prepared.username} got=${buyer.username}`
+      );
+    }
+    check(null, {
+      'lot-bidder-number prepared': () => preparedOk,
+      'lot-bidder-number matches user': () => userMatch,
+    });
+    if (!preparedOk || !userMatch) {
+      logError(
+        'iteration.abort',
+        `step=lot_bidder_prepared reason=${!preparedOk ? 'empty_bidder_number' : 'username_mismatch'} user=${buyer.username} lotId=${LOT_ID}`
+      );
+      sleep(1);
+      return;
+    }
+    logInfo(
+      'lot-bidder-number.use_prepared',
+      `user=${buyer.username} lotId=${LOT_ID} bidderNumber=${bidderNumber} source=setup`
+    );
   });
-  if (!bidderNumber) {
-    logInfo('iteration.abort', `reason=lot_bidder_number_failed user=${buyer.username}`);
-    sleep(1);
+  if (!bidderNumber || prepared.username !== buyer.username) {
     return;
   }
 
+  let wsResult;
   group(`3. WS visitLot → connected → offer (${buyer.username})`, () => {
-    runWebsocketVisitConnected(session, bidderNumber);
+    wsResult = runWebsocketVisitConnected(session, bidderNumber);
   });
+  if (wsResult && !wsResult.ok) {
+    const err = wsResult.error || {};
+    logError(
+      'iteration.abort',
+      `step=${err.step || 'ws_offer'} reason=${err.reason || 'unknown'} user=${buyer.username} lotId=${LOT_ID} code=${err.code || '-'} message=${err.message || err.detail || '-'} httpStatus=${err.httpStatus || '-'}`
+    );
+    sleep(1);
+    return;
+  }
 
   logInfo('iteration.done', `user=${buyer.username} lotId=${LOT_ID} bidderNumber=${bidderNumber}`);
   sleep(1);
@@ -930,9 +1298,9 @@ export default function () {
 
 export const handleSummary = createHandleSummary(function () {
   return {
-    titleBase: __ENV.REPORT_TITLE || 'k6 login → lot-bidder → visitLot → connected → offer',
+    titleBase: __ENV.REPORT_TITLE || 'k6 login → lot-bidder (setup) → visitLot → connected → offer',
     reportDir: __ENV.REPORT_DIR || 'k6-reports',
-    reportBasename: __ENV.REPORT_BASENAME || 'buyer-send-offer',
+    reportBasename: __ENV.REPORT_BASENAME || 'buyer-send-offer-buffer',
     meta: {
       baseUrl: BASE_URL,
       wsUrl: WS_URL,
@@ -957,10 +1325,12 @@ export const handleSummary = createHandleSummary(function () {
       ackRetryMs: ACK_RETRY_MS,
       ackCooldownMs: ACK_COOLDOWN_MS,
       offerIntervalMs: OFFER_INTERVAL_MS,
-      httpStaggerMs: HTTP_STAGGER_MS,
+      lotBidderGapMs: LOT_BIDDER_GAP_MS,
       lotBidderRetries: LOT_BIDDER_RETRIES,
       lotBidderRetryMs: LOT_BIDDER_RETRY_MS,
       httpTimeoutMs: HTTP_TIMEOUT_MS,
+      setupTimeout: SETUP_TIMEOUT,
+      lotBidderPrepareMode: 'setup-sequential',
       lotLineId: LOT_LINE_ID,
       auctionNo: AUCTION_NO,
       offerEvent: OFFER_EVENT,
