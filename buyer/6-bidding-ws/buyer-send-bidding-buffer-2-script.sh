@@ -152,7 +152,7 @@ K6_ARGS=(
   -e "USERNAME_PREFIX=${USERNAME_PREFIX}"
   -e "REPORT_DIR=${REPORT_DIR}"
   -e "REPORT_BASENAME=buyer-send-bidding-buffer-2"
-  -e "REPORT_TITLE=buyer setup(visitLot→connected) → VU bidding (buffer-2)"
+  -e "REPORT_TITLE=buyer bidding phase (buffer-2)"
 )
 
 if [ -n "$VUS" ]; then

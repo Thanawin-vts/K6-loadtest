@@ -31,7 +31,7 @@ import ws from 'k6/ws';
 import { check, group, sleep, fail } from 'k6';
 import { Counter, Trend } from 'k6/metrics';
 import encoding from 'k6/encoding';
-import { createHandleSummary } from '../../lib/k6-report.js';
+import { createHandleSummary, BIDDING_REPORT_METRICS } from '../../lib/k6-report.js';
 import { getMockBuyer } from '../../buyer-mock-user.js';
 
 const VU_COMPLETE_CHECK_PREFIX = '__vu_complete__';
@@ -1830,12 +1830,19 @@ export const handleSummary = createHandleSummary(function (data) {
   );
 
   return {
-    titleBase: __ENV.REPORT_TITLE || 'k6 setup(login→lot-bidder→visitLot→connected) → VU bidding',
+    titleBase: __ENV.REPORT_TITLE || 'k6 bidding phase (buffer-2)',
     reportDir: __ENV.REPORT_DIR || 'k6-reports',
     reportBasename: __ENV.REPORT_BASENAME || 'buyer-send-bidding-buffer-2',
     extraStdout: formatVuCompleteStdout(vuCompletions),
     extraFiles: extraFiles,
+    // JSON/HTML: เฉพาะ bidding metrics (terminal ยังเป็น summary เต็ม)
+    metricNames: BIDDING_REPORT_METRICS,
+    checkNameRe: /bidding|ack/i,
+    dropVuComplete: true,
+    keepContextMetrics: true,
     meta: {
+      reportScope: 'bidding',
+      reportMetrics: BIDDING_REPORT_METRICS,
       baseUrl: BASE_URL,
       wsUrl: WS_URL,
       lotId: LOT_ID,
