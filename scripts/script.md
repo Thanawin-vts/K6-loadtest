@@ -98,13 +98,17 @@ k6-test/k6-reports/
 └── yyyyMMdd/
     └── HHmmss/
         ├── yyyyMMdd-HHmmss.txt          # from script.sh
+        ├── yyyyMMdd-HHmmss.txt          # from script.sh (timing + CPU/RAM summary)
+        ├── resources-metrics.csv        # detailed 1s CPU/RAM time-series
         ├── login-visit-connected.json   # from k6 handleSummary
         └── login-visit-connected.html   # from k6 handleSummary
 ```
 
 JSON/HTML are produced by [`../lib/k6-report.js`](../lib/k6-report.js) into `REPORT_DIR`.
+`resources-metrics.csv` and CPU/RAM summary are produced by [`./monitor-resources.sh`](./monitor-resources.sh).
 
 ### Timing file (`yyyyMMdd-HHmmss.txt`)
+### Timing & Resource summary file (`yyyyMMdd-HHmmss.txt`)
 
 ```text
 Test Execution
@@ -113,7 +117,20 @@ File Name       : 20260813/070303/20260813-070303.txt
 Start Date Time : 13/08/2026 07:03:03
 End Date Time   : 13/08/2026 07:03:11
 Duration        : 00:00:08
+File Name       : 20260905/001500/20260905-001500.txt
+Start Date Time : 05/09/2026 00:15:00
+End Date Time   : 05/09/2026 00:15:30
+Duration        : 00:00:30
+--------------------------------------------------
+System Resource Usage (Client / Load Generator):
+Host Total RAM  : 32.00 GB
+Host Peak Load  : 1.93 (1m load avg)
+Host Peak CPU   : 16.0%
+k6 Process CPU  : Max 45.2% | Avg 22.1%
+k6 Process RAM  : Max 180.5 MB | Avg 152.0 MB
+Status          : NORMAL (No client bottleneck detected)
 ==================================================
+Detailed CSV    : resources-metrics.csv
 ```
 
 | Field | Meaning |
@@ -122,6 +139,12 @@ Duration        : 00:00:08
 | `Start Date Time` | Before `k6 run` (`dd/mm/yyyy HH:MM:SS`, Bangkok) |
 | `End Date Time` | After `k6 run` finishes |
 | `Duration` | Wall clock `HH:MM:SS` (`END_EPOCH - START_EPOCH`) |
+| `Host Total RAM` | Total physical RAM of the runner machine |
+| `Host Peak Load` | Max 1-minute load average observed during test |
+| `Host Peak CPU` | Max CPU utilization % across the host machine |
+| `k6 Process CPU` | Max and Average CPU % used by k6 process |
+| `k6 Process RAM` | Max and Average RSS Memory (MB) used by k6 process |
+| `Status` | `NORMAL` or `WARNING` if host/k6 CPU >= 90% (bottleneck alert) |
 
 ## Pre-check behavior
 

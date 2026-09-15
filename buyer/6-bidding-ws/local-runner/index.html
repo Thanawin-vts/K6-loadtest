@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buyer Bidding WS — Local Runner</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --fg: #e6edf3; --muted: #8b949e;
+    --green: #3fb950; --red: #f85149; --amber: #d29922; --cyan: #39c5cf; --violet: #bc8cff;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: 340px 1fr; gap: 12px; padding: 12px; max-width: 1500px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+  .card h2 { font-size: 13px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+  label b { color: var(--fg); font-weight: 600; }
+  input[type=text], input[type=number] { width: 100%; padding: 7px 9px; background: #0d1117; border: 1px solid var(--border); border-radius: 6px; color: var(--fg); font-size: 13px; }
+  input:focus { outline: none; border-color: #1f6feb; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .btn { display: inline-block; border: 1px solid var(--border); background: #21262d; color: var(--fg); border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  .btn:hover { background: #30363d; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-run { background: #238636; border-color: #2ea043; font-weight: 700; width: 100%; padding: 10px; font-size: 14px; }
+  .btn-run:hover { background: #2ea043; }
+  .btn-stop { background: #5a1f1f; border-color: var(--red); width: 100%; margin-top: 8px; }
+  .btn-stop:hover { background: #7a2a2a; }
+  .cmd { margin-top: 10px; font: 11px/1.5 ui-monospace, monospace; background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 8px; word-break: break-all; color: var(--muted); }
+  .check { display: flex; gap: 6px; align-items: center; font-size: 13px; margin-top: 10px; }
+  .err { color: var(--red); font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
+  /* progress */
+  .statusbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .badge { padding: 3px 12px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+  .badge.running { background: #1f6feb; }
+  .badge.done { background: #238636; }
+  .badge.error { background: var(--red); }
+  .badge.stopped { background: #6e7681; }
+  .badge.idle { background: #30363d; color: var(--muted); }
+  .bar { height: 8px; background: #0d1117; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; margin: 8px 0; }
+  .bar > div { height: 100%; width: 30%; background: #1f6feb; border-radius: 999px; }
+  .bar.running > div { animation: slide 1.2s infinite ease-in-out; }
+  .bar.done > div { width: 100%; background: var(--green); animation: none; }
+  .bar.error > div, .bar.stopped > div { width: 100%; background: var(--red); animation: none; }
+  .bar.stopped > div { background: #6e7681; }
+  @keyframes slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+  .stats { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .stats b { color: var(--fg); }
+  /* filters */
+  .toolbar { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  .chip { border: 1px solid var(--border); background: #0d1117; color: var(--muted); border-radius: 999px; padding: 3px 11px; font-size: 12px; cursor: pointer; }
+  .chip b { font-weight: 700; }
+  .chip.on { color: var(--fg); border-color: #1f6feb; background: #1c2b45; }
+  .chip[data-level=error].on { border-color: var(--red); background: #3d1d1d; }
+  .chip[data-level=warn].on { border-color: var(--amber); background: #3a2f14; }
+  .chip[data-level=setup].on { border-color: var(--cyan); background: #14333a; }
+  .toolbar input[type=text] { width: 170px; }
+  .toolbar .spacer { flex: 1; }
+  /* logs */
+  #logs { height: 52vh; min-height: 300px; overflow-y: auto; background: #010409; border: 1px solid var(--border); border-radius: 6px; padding: 8px 0; font: 12px/1.55 ui-monospace, SFMono-Regular, monospace; }
+  #logs.wrap .ln { white-space: pre-wrap; word-break: break-all; }
+  .ln { padding: 0 12px; white-space: pre; color: #c9d1d9; }
+  .ln:nth-child(odd) { background: rgba(255,255,255,.015); }
+  .ln.error { color: #ffa198; background: rgba(248,81,73,.10); }
+  .ln.warn { color: #e3b341; }
+  .ln.setup { color: #79c0ff; }
+  .ln.info { color: #a5d6a7; }
+  .ln.vu { color: #d2a8ff; }
+  .ln.k6 { color: #8b949e; }
+  .ln.sys { color: #f0f6fc; font-weight: 600; }
+  .ln .src { opacity: .45; font-size: 10px; margin-right: 8px; }
+  .hidden { display: none !important; }
+  #history { margin-top: 12px; font-size: 12px; }
+  #history .hrow { display: flex; gap: 8px; padding: 5px 8px; border-top: 1px solid var(--border); cursor: pointer; align-items: center; }
+  #history .hrow:hover { background: #1c2128; }
+  #history .hrow.cur { background: #1c2b45; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .dot.running { background: #1f6feb; } .dot.done { background: var(--green); }
+  .dot.error { background: var(--red); } .dot.stopped { background: #6e7681; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔥 Buyer Bidding WS — Local Runner</h1>
+  <span class="sub">buyer-send-bidding-buffer-2-script.sh · รันบนเครื่อง local · live logs ผ่าน SSE</span>
+</header>
+<main>
+  <section class="card">
+    <h2>Parameters</h2>
+    <form id="form" onsubmit="return false">
+      <div class="row2">
+        <div><label>lotId <b>(arg1)</b></label><input type="text" id="lotId" value="1079"></div>
+        <div><label>lotLineId <b>(arg2) *</b></label><input type="text" id="lotLineId" value="10637" placeholder="เช่น 10637"></div>
+      </div>
+      <div class="row2">
+        <div><label>auctionNo <b>(arg3)</b></label><input type="text" id="auctionNo" value="1"></div>
+        <div><label>wsHold <b>(arg4)</b> เช่น 10m</label><input type="text" id="wsHold" value="10m"></div>
+      </div>
+      <div class="row2">
+        <div><label>startLoopIndex <b>(arg5)</b></label><input type="text" id="startLoopIndex" value="1"></div>
+        <div><label>endLoopIndex <b>(arg6)</b></label><input type="text" id="endLoopIndex" value="100"></div>
+      </div>
+      <label>usernamePrefix <b>(arg7)</b></label><input type="text" id="usernamePrefix" value="bltuser">
+      <div class="row2">
+        <div><label>vus <b>(arg8)</b> ว่าง = default</label><input type="text" id="vus" value="100" placeholder="(ว่าง = buyerCount)"></div>
+        <div><label>biddingDelayMs <b>(arg9)</b></label><input type="text" id="biddingDelayMs" value="100" placeholder="(ว่าง = 0)"></div>
+      </div>
+      <label>bidding turn <b>(BIDDING_TURN_MS)</b> ว่าง = 100</label><input type="text" id="biddingTurnMs" value="100" placeholder="(ว่าง = 100)">
+      <label class="check"><input type="checkbox" id="disconnected" checked> Disconnected <b>(arg11)</b> — หลัง bidding ทำ leaveLot + disconnect ทีละ VU</label>
+      <label class="check"><input type="checkbox" id="dryRun"> Dry-run (ไม่ยิง k6 จริง — เทสต์หน้าเว็บ/สี/filter)</label>
+      <div style="margin-top:12px"><button class="btn btn-run" id="btnRun">▶ รันเลย</button></div>
+      <button class="btn btn-stop" id="btnStop" disabled>■ หยุด (Stop)</button>
+      <div class="err" id="formErr"></div>
+      <div class="cmd" id="cmdPreview"></div>
+    </form>
+    <div id="history"><h2 style="margin-top:14px">ประวัติรัน (session นี้)</h2><div id="histList"></div></div>
+  </section>
+
+  <section class="card">
+    <h2>Progress &amp; Logs</h2>
+    <div class="statusbar">
+      <span class="badge idle" id="badge">idle</span>
+      <span class="stats">
+        <span>run: <b id="stRun">-</b></span>
+        <span>elapsed: <b id="stElapsed">-</b></span>
+        <span>buyers: <b id="stBuyers">-</b></span>
+        <span>lines: <b id="stLines">0</b></span>
+      </span>
+    </div>
+    <div class="bar" id="bar"><div></div></div>
+    <div class="toolbar" id="filters">
+      <button class="chip on" data-level="all">All <b id="cAll">0</b></button>
+      <button class="chip on" data-level="info">INFO <b id="cInfo">0</b></button>
+      <button class="chip on" data-level="setup">SETUP <b id="cSetup">0</b></button>
+      <button class="chip on" data-level="vu">VU <b id="cVu">0</b></button>
+      <button class="chip on" data-level="k6">k6 <b id="cK6">0</b></button>
+      <button class="chip on" data-level="warn">WARN <b id="cWarn">0</b></button>
+      <button class="chip on" data-level="error">ERROR <b id="cError">0</b></button>
+      <button class="chip on" data-level="out">OUT <b id="cOut">0</b></button>
+      <button class="chip on" data-level="sys">SYS <b id="cSys">0</b></button>
+      <span class="spacer"></span>
+      <input type="text" id="q" placeholder="🔍 ค้นหา log…">
+      <button class="chip on" id="tAuto">auto-scroll</button>
+      <button class="chip" id="tWrap">wrap</button>
+      <button class="chip" id="btnDl">⬇ logs</button>
+    </div>
+    <div id="logs"></div>
+  </section>
+</main>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const FIELDS = ['lotId','lotLineId','auctionNo','wsHold','startLoopIndex','endLoopIndex','usernamePrefix','vus','biddingDelayMs','biddingTurnMs'];
+const state = {
+  runId: null, es: null, status: 'idle', startTime: null,
+  lines: [], counts: { error:0, warn:0, setup:0, info:0, vu:0, k6:0, out:0, sys:0 },
+  levels: new Set(['info','setup','vu','k6','warn','error','out','sys']),
+  q: '', auto: true, timer: null,
+};
+
+/** ปลอดภัย: parse JSON ที่อาจว่าง/เสีย → { ok, data, raw } */
+function safeParse(raw) {
+  try { return { ok: true, data: JSON.parse(raw), raw }; }
+  catch { return { ok: false, data: null, raw: String(raw || '').slice(0, 200) }; }
+}
+/** fetch + อ่าน body เป็น JSON แบบไม่พัง ไม่ว่า server จะตอบอะไรกลับมา */
+async function respJson(res) {
+  const raw = await res.text();
+  const { data } = safeParse(raw);
+  return { status: res.status, ok: res.ok, data, raw: raw.slice(0, 200) };
+}
+
+function params() {
+  const o = {};
+  for (const f of FIELDS) o[f] = $(f).value.trim();
+  o.disconnected = $('disconnected').checked;
+  o.dryRun = $('dryRun').checked;
+  return o;
+}
+function previewCmd() {
+  const p = params();
+  const argv = [p.lotId||'975', p.lotLineId, p.auctionNo||'1', p.wsHold||'30m',
+    p.startLoopIndex||'1', p.endLoopIndex||'100', p.usernamePrefix||'loadtestuser',
+    p.vus, p.biddingDelayMs, p.biddingTurnMs, p.disconnected ? 'true' : 'false'];
+  $('cmdPreview').textContent = 'sh buyer-send-bidding-buffer-2-script.sh ' +
+    argv.map(s => s === '' ? "''" : s).join(' ');
+}
+document.querySelectorAll('#form input').forEach(el => el.addEventListener('input', previewCmd));
+previewCmd();
+
+// ---- status / progress
+function setBadge(s) {
+  const b = $('badge');
+  b.className = 'badge ' + s;
+  b.textContent = { idle:'idle', running:'● running', done:'✓ done', error:'✗ error', stopped:'■ stopped' }[s] || s;
+  $('bar').className = 'bar ' + (s === 'idle' ? '' : s);
+  state.status = s;
+  $('btnStop').disabled = (s !== 'running');
+  $('btnRun').disabled = (s === 'running');
+}
+function tickElapsed() {
+  if (!state.startTime || state.status !== 'running') return;
+  const s = Math.floor((Date.now() - new Date(state.startTime)) / 1000);
+  $('stElapsed').textContent = `${String(Math.floor(s/3600)).padStart(2,'0')}:${String(Math.floor(s/60)%60).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+}
+
+// ---- logs
+function matchFilter(line) {
+  if (line.level !== 'sys' && !state.levels.has(line.level)) return false;
+  if (state.q && !line.text.toLowerCase().includes(state.q)) return false;
+  return true;
+}
+function appendLine(line) {
+  state.lines.push(line);
+  if (state.counts[line.level] !== undefined) state.counts[line.level]++;
+  updateCounts();
+  if (!matchFilter(line)) return;
+  const div = document.createElement('div');
+  div.className = 'ln ' + line.level;
+  const src = document.createElement('span');
+  src.className = 'src'; src.textContent = line.src;
+  div.appendChild(src);
+  div.appendChild(document.createTextNode(line.text));
+  $('logs').appendChild(div);
+  // trim DOM for perf
+  const box = $('logs');
+  while (box.children.length > 8000) box.removeChild(box.firstChild);
+  if (state.auto) box.scrollTop = box.scrollHeight;
+  $('stLines').textContent = state.lines.length;
+}
+function updateCounts() {
+  const c = state.counts;
+  $('cError').textContent = c.error; $('cWarn').textContent = c.warn;
+  $('cSetup').textContent = c.setup; $('cInfo').textContent = c.info;
+  $('cVu').textContent = c.vu; $('cK6').textContent = c.k6; $('cOut').textContent = c.out;
+  $('cSys').textContent = c.sys;
+  $('cAll').textContent = state.lines.length;
+}
+function refilter() {
+  const box = $('logs'); box.innerHTML = '';
+  for (const l of state.lines.slice(-8000)) {
+    if (!matchFilter(l)) continue;
+    const div = document.createElement('div');
+    div.className = 'ln ' + l.level;
+    div.textContent = l.text;
+    box.appendChild(div);
+  }
+  if (state.auto) box.scrollTop = box.scrollHeight;
+}
+document.querySelectorAll('#filters .chip[data-level]').forEach(ch => {
+  ch.addEventListener('click', () => {
+    const lv = ch.dataset.level;
+    if (lv === 'all') {
+      const allOn = state.levels.size >= 8;
+      state.levels = allOn ? new Set() : new Set(['info','setup','vu','k6','warn','error','out','sys']);
+      document.querySelectorAll('#filters .chip[data-level]').forEach(c => c.classList.toggle('on', !allOn));
+    } else {
+      state.levels.has(lv) ? state.levels.delete(lv) : state.levels.add(lv);
+      ch.classList.toggle('on', state.levels.has(lv));
+    }
+    refilter();
+  });
+});
+$('q').addEventListener('input', e => { state.q = e.target.value.toLowerCase(); refilter(); });
+$('tAuto').addEventListener('click', () => { state.auto = !state.auto; $('tAuto').classList.toggle('on', state.auto); });
+$('tWrap').addEventListener('click', () => { $('logs').classList.toggle('wrap'); $('tWrap').classList.toggle('on'); });
+$('btnDl').addEventListener('click', () => {
+  const txt = state.lines.map(l => `[${l.t}][${l.level}][${l.src}] ${l.text}`).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain' }));
+  a.download = `run-${state.runId || 'noids'}.log`;
+  a.click();
+});
+
+// ---- run lifecycle
+async function refreshHistory() {
+  try {
+    const res = await fetch('/api/runs');
+    const j = await respJson(res);
+    if (!j.data || !Array.isArray(j.data.runs)) return;
+    const list = $('histList'); list.innerHTML = '';
+    for (const s of j.data.runs) {
+      const row = document.createElement('div');
+      row.className = 'hrow' + (s.id === state.runId ? ' cur' : '');
+      row.innerHTML = `<span class="dot ${s.status}"></span><span><b>${s.id}</b> · buyers ${s.buyerCount} · ${s.totalLines} lines · err ${s.counts?.error ?? 0}</span>`;
+      row.title = s.cmd;
+      row.onclick = () => attach(s.id);
+      list.appendChild(row);
+    }
+  } catch { /* ignore */ }
+}
+function resetView() {
+  state.lines = []; state.counts = { error:0, warn:0, setup:0, info:0, vu:0, k6:0, out:0, sys:0 };
+  $('logs').innerHTML = ''; updateCounts(); $('stLines').textContent = '0';
+}
+function attach(id) {
+  if (state.es) { state.es.close(); state.es = null; }
+  state.runId = id; resetView();
+  $('stRun').textContent = id;
+  setBadge('running');
+  const es = new EventSource(`/api/runs/${id}/events`);
+  state.es = es;
+  es.addEventListener('log', e => {
+    const p = safeParse(e.data);
+    if (p.ok && p.data) appendLine(p.data);
+  });
+  es.addEventListener('status', e => {
+    const p = safeParse(e.data);
+    if (!p.ok || !p.data) return;
+    const s = p.data;
+    state.startTime = s.startTime;
+    $('stBuyers').textContent = s.buyerCount;
+    if (s.status !== 'running') {
+      setBadge(s.status);
+      es.close();
+      refreshHistory();
+    }
+  });
+  es.onerror = async () => {
+    // SSE drop → poll status once
+    try {
+      const res = await fetch(`/api/runs/${id}`);
+      const { data } = await respJson(res);
+      if (data && data.status !== 'running') { setBadge(data.status); es.close(); refreshHistory(); }
+    } catch { /* keep trying */ }
+  };
+  refreshHistory();
+}
+$('btnRun').onclick = async () => {
+  $('formErr').textContent = '';
+  try {
+    const res = await fetch('/api/runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params()) });
+    const { status, ok, data, raw } = await respJson(res);
+    if (!ok) { $('formErr').textContent = (data?.errors || [`HTTP ${status}`, raw]).join('\n'); return; }
+    if (!data || !data.id) {
+      $('formErr').textContent = `Server ตอบไม่ปกติ (HTTP ${status}): body='${raw}' — ลอง refresh หน้า + restart server ดู`;
+      return;
+    }
+    clearInterval(state.timer);
+    state.startTime = data.startTime;
+    $('stBuyers').textContent = data.buyerCount;
+    $('stElapsed').textContent = '00:00:00';
+    state.timer = setInterval(tickElapsed, 1000);
+    attach(data.id);
+  } catch (e) { $('formErr').textContent = String(e); }
+};
+$('btnStop').onclick = async () => {
+  if (!state.runId) return;
+  await fetch(`/api/runs/${state.runId}/stop`, { method: 'POST' });
+};
+refreshHistory();
+</script>
+</body>
+</html>

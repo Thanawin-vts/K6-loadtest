@@ -22,11 +22,15 @@ k6-test/
 │   └── k6-report.js                  # shared JSON/HTML report helper
 ├── scripts/
 │   └── script.sh                     # wrapper: check JS → run k6 → write timing txt
+│   ├── script.sh                     # wrapper: check JS → run k6 → write timing & resource txt
+│   └── monitor-resources.sh          # lightweight CPU & RAM monitor (macOS/Linux)
 └── k6-reports/                       # generated reports (gitignored except .gitkeep)
     └── yyyyMMdd/HHmmss/
         ├── login-visit-connected.json
         ├── login-visit-connected.html
         └── yyyyMMdd-HHmmss.txt       # from script.sh only
+        ├── resources-metrics.csv     # 1-second CPU & RAM time series
+        └── yyyyMMdd-HHmmss.txt       # timing & system resource summary
 ```
 
 ## Manual usage
@@ -171,6 +175,7 @@ Bash wrapper around the scenario.
 | File Name label | `yyyyMMdd/HHmmss/yyyyMMdd-HHmmss.txt` (path under `k6-reports`) |
 
 Example timing file:
+Example timing & resource file:
 
 ```text
 Test Execution
@@ -179,7 +184,16 @@ File Name       : 20260813/070303/20260813-070303.txt
 Start Date Time : 13/08/2026 07:03:03
 End Date Time   : 13/08/2026 07:03:11
 Duration        : 00:00:08
+--------------------------------------------------
+System Resource Usage (Client / Load Generator):
+Host Total RAM  : 32.00 GB
+Host Peak Load  : 1.93 (1m load avg)
+Host Peak CPU   : 16.0%
+k6 Process CPU  : Max 45.2% | Avg 22.1%
+k6 Process RAM  : Max 180.5 MB | Avg 152.0 MB
+Status          : NORMAL (No client bottleneck detected)
 ==================================================
+Detailed CSV    : resources-metrics.csv
 ```
 
 Default env passed to k6 (edit in the shell script to change):

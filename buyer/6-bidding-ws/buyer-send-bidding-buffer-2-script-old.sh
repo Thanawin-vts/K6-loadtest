@@ -1,21 +1,28 @@
 #!/bin/bash
 #
 # usage:
-#   ./buyer-send-bidding-buffer-script.sh [lotId] [lotLineId] [auctionNo] [wsHold] [startLoopIndex] [endLoopIndex] [usernamePrefix] [vus] [biddingDelayMs]
+#   ./buyer-send-bidding-buffer-2-script.sh [lotId] [lotLineId] [auctionNo] [wsHold] [startLoopIndex] [endLoopIndex] [usernamePrefix] [vus] [biddingDelayMs]
 #
 # example:
-#   ./buyer-send-bidding-buffer-script.sh 975 <lotLineId> 1 5m 1 10
-#   ./buyer-send-bidding-buffer-script.sh 975 <lotLineId> 1 10m 1 50 loadtestuser 20 500
+#   ./buyer-send-bidding-buffer-2-script.sh 975 <lotLineId> 1 5m 1 10
+#   ./buyer-send-bidding-buffer-2-script.sh 975 <lotLineId> 1 10m 1 50 loadtestuser 20 500
+#
+# Setup (sequential per user):
+#   login → lot-bidder-number → WS visitLot → connected → settle → close
+# VU (parallel):
+#   login → WS rejoin (visitLot → connected) → bidding
 #
 # Optional env (passed through to k6):
 #   BIDDING_EVENT, BIDDING_ACTION, ACK, STAGGER_MS,
 #   ACK_TIMEOUT_MS, ACK_RETRY_MS, ACK_COOLDOWN_MS, BIDDING_INTERVAL_MS,
-#   BIDDING_DELAY_MS, BIDDING, LOT_BIDDER_GAP_MS, LOT_BIDDER_RETRIES,
-#   LOT_BIDDER_RETRY_MS, HTTP_TIMEOUT_MS, SETUP_TIMEOUT (default 0 = 24h),
-#   BASE_URL, WS_URL, USER_PICK, EXECUTOR, LOG_WS_MSG
+#   BIDDING_DELAY_MS, BIDDING, LOT_BIDDER_GAP_MS, WS_JOIN_GAP_MS,
+#   WS_REJOIN_STAGGER_MS (default 200), WS_RECONNECT (default true),
+#   WS_RECONNECT_DELAY_MS (default 1000), WS_RECONNECT_MAX (default 0=unlimited),
+#   LOT_BIDDER_RETRIES, LOT_BIDDER_RETRY_MS, HTTP_TIMEOUT_MS,
+#   SETUP_TIMEOUT (default 0 = 24h), BASE_URL, WS_URL, USER_PICK, EXECUTOR, LOG_WS_MSG
 #
 # Depends on:
-#   ./k6-buyer-send-bidding-buffer.js  # setup: lot-bidder ทีละ user → parallel WS bidding
+#   ./k6-buyer-send-bidding-buffer-2.js
 #   ../../buyer-mock-user.js
 #   ../../lib/k6-report.js
 #
@@ -45,7 +52,7 @@ BIDDING_DELAY_MS="${9:-${BIDDING_DELAY_MS:-}}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-K6_SCRIPT="${SCRIPT_DIR}/k6-buyer-send-bidding-buffer.js"
+K6_SCRIPT="${SCRIPT_DIR}/k6-buyer-send-bidding-buffer-2.js"
 
 if [ ! -f "$K6_SCRIPT" ]; then
   echo "file not found: $K6_SCRIPT"
@@ -120,7 +127,10 @@ if [ -n "$BIDDING_DELAY_MS" ]; then
 else
   echo "biddingDelayMs  : (default = 0)"
 fi
-echo "lotBidderMode   : setup-sequential"
+echo "setupMode       : sequential login → lot-bidder → visitLot → connected"
+echo "vuMode          : staggered rejoin → bidding (+ reconnect until WS_HOLD)"
+echo "rejoinStaggerMs : ${WS_REJOIN_STAGGER_MS:-200}"
+echo "reconnect       : ${WS_RECONNECT:-true}"
 echo "report dir      : $REPORT_DIR"
 echo "Start Date Time : $START_TIME"
 echo ""
@@ -141,8 +151,8 @@ K6_ARGS=(
   -e "END_LOOP_INDEX=${END_LOOP_INDEX}"
   -e "USERNAME_PREFIX=${USERNAME_PREFIX}"
   -e "REPORT_DIR=${REPORT_DIR}"
-  -e "REPORT_BASENAME=buyer-send-bidding-buffer"
-  -e "REPORT_TITLE=buyer visitLot → connected → bidding (buffer)"
+  -e "REPORT_BASENAME=buyer-send-bidding-buffer-2"
+  -e "REPORT_TITLE=buyer bidding phase (buffer-2)"
 )
 
 if [ -n "$VUS" ]; then
@@ -189,6 +199,26 @@ if [ -n "${LOT_BIDDER_GAP_MS:-}" ]; then
   K6_ARGS+=(-e "LOT_BIDDER_GAP_MS=${LOT_BIDDER_GAP_MS}")
 fi
 
+if [ -n "${WS_JOIN_GAP_MS:-}" ]; then
+  K6_ARGS+=(-e "WS_JOIN_GAP_MS=${WS_JOIN_GAP_MS}")
+fi
+
+if [ -n "${WS_REJOIN_STAGGER_MS:-}" ]; then
+  K6_ARGS+=(-e "WS_REJOIN_STAGGER_MS=${WS_REJOIN_STAGGER_MS}")
+fi
+
+if [ -n "${WS_RECONNECT:-}" ]; then
+  K6_ARGS+=(-e "WS_RECONNECT=${WS_RECONNECT}")
+fi
+
+if [ -n "${WS_RECONNECT_DELAY_MS:-}" ]; then
+  K6_ARGS+=(-e "WS_RECONNECT_DELAY_MS=${WS_RECONNECT_DELAY_MS}")
+fi
+
+if [ -n "${WS_RECONNECT_MAX:-}" ]; then
+  K6_ARGS+=(-e "WS_RECONNECT_MAX=${WS_RECONNECT_MAX}")
+fi
+
 if [ -n "${LOT_BIDDER_RETRIES:-}" ]; then
   K6_ARGS+=(-e "LOT_BIDDER_RETRIES=${LOT_BIDDER_RETRIES}")
 fi
@@ -205,7 +235,27 @@ if [ -n "${SETUP_TIMEOUT:-}" ]; then
   K6_ARGS+=(-e "SETUP_TIMEOUT=${SETUP_TIMEOUT}")
 fi
 
-K6_WEB_DASHBOARD=true K6_WEB_DASHBOARD_EXPORT=${REPORT_DIR}/buyer-send-bidding-buffer-dashboard.html k6 run "$K6_SCRIPT" "${K6_ARGS[@]}"
+# Load resource monitor helper
+if [ -f "${REPO_ROOT}/scripts/monitor-resources.sh" ]; then
+  source "${REPO_ROOT}/scripts/monitor-resources.sh"
+fi
+
+# Trap interrupt signals to clean up background monitor and k6
+trap 'if [ -n "$K6_PID" ]; then kill "$K6_PID" 2>/dev/null; fi; if [ -n "$MONITOR_PID" ]; then kill "$MONITOR_PID" 2>/dev/null; fi; exit 1' INT TERM
+
+K6_WEB_DASHBOARD=true K6_WEB_DASHBOARD_EXPORT=${REPORT_DIR}/buyer-send-bidding-buffer-2-dashboard.html k6 run "$K6_SCRIPT" "${K6_ARGS[@]}" &
+K6_PID=$!
+
+if type start_resource_monitor >/dev/null 2>&1; then
+  start_resource_monitor "$K6_PID" "$REPORT_DIR"
+fi
+
+wait "$K6_PID"
+K6_EXIT_CODE=$?
+
+if type stop_resource_monitor >/dev/null 2>&1; then
+  RESOURCE_SUMMARY=$(stop_resource_monitor "$REPORT_DIR")
+fi
 
 END_TIME=$(TZ=Asia/Bangkok date +"%d/%m/%Y %H:%M:%S")
 END_EPOCH=$(date +%s)
@@ -224,7 +274,7 @@ cat > "$TIMESTAMP_FILE" <<EOF
 Test Execution
 ==================================================
 File Name       : $FILE_NAME_LABEL
-Scenario        : buyer visitLot → connected → bidding (buffer — lot-bidder setup sequential)
+Scenario        : buffer-2 — setup(login→lot-bidder→visitLot→connected) → VU bidding
 Lot ID          : $LOT_ID
 Lot Line ID     : $LOT_LINE_ID
 Auction No      : $AUCTION_NO
@@ -237,10 +287,15 @@ Start Date Time : $START_TIME
 End Date Time   : $END_TIME
 Duration        : $DURATION_FORMAT
 ==================================================
+${RESOURCE_SUMMARY}
 EOF
 
 echo ""
 cat "$TIMESTAMP_FILE"
 echo ""
 echo "Timestamp saved to: $TIMESTAMP_FILE"
-echo "Reports: ${REPORT_DIR}/buyer-send-bidding-buffer.{json,html}"
+echo "Reports: ${REPORT_DIR}/buyer-send-bidding-buffer-2.{json,html}"
+echo "Enterprise Dashboard: ${REPORT_DIR}/buyer-send-bidding-buffer-2.html"
+echo "JSON Summary: ${REPORT_DIR}/buyer-send-bidding-buffer-2.json"
+echo "VU complete: ${REPORT_DIR}/buyer-send-bidding-buffer-2-vu-complete.json"
+exit $K6_EXIT_CODE

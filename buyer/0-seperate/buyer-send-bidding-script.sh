@@ -170,6 +170,27 @@ if [ -n "${BIDDING_DELAY_MS:-}" ]; then
 fi
 
 k6 run "$K6_SCRIPT" "${K6_ARGS[@]}"
+# Load resource monitor helper
+if [ -f "${REPO_ROOT}/scripts/monitor-resources.sh" ]; then
+  source "${REPO_ROOT}/scripts/monitor-resources.sh"
+fi
+
+# Trap interrupt signals to clean up background monitor and k6
+trap 'if [ -n "$K6_PID" ]; then kill "$K6_PID" 2>/dev/null; fi; if [ -n "$MONITOR_PID" ]; then kill "$MONITOR_PID" 2>/dev/null; fi; exit 1' INT TERM
+
+k6 run "$K6_SCRIPT" "${K6_ARGS[@]}" &
+K6_PID=$!
+
+if type start_resource_monitor >/dev/null 2>&1; then
+  start_resource_monitor "$K6_PID" "$REPORT_DIR"
+fi
+
+wait "$K6_PID"
+K6_EXIT_CODE=$?
+
+if type stop_resource_monitor >/dev/null 2>&1; then
+  RESOURCE_SUMMARY=$(stop_resource_monitor "$REPORT_DIR")
+fi
 
 END_TIME=$(TZ=Asia/Bangkok date +"%d/%m/%Y %H:%M:%S")
 END_EPOCH=$(date +%s)
@@ -201,6 +222,7 @@ Start Date Time : $START_TIME
 End Date Time   : $END_TIME
 Duration        : $DURATION_FORMAT
 ==================================================
+${RESOURCE_SUMMARY}
 EOF
 
 echo ""
@@ -208,3 +230,4 @@ cat "$TIMESTAMP_FILE"
 echo ""
 echo "Timestamp saved to: $TIMESTAMP_FILE"
 echo "Reports: ${REPORT_DIR}/buyer-send-bidding-separate.{json,html}"
+exit $K6_EXIT_CODE
