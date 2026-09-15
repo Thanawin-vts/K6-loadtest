@@ -3,7 +3,9 @@
  * setup (sequential per buyer):
  *   Login → Lot-Bidder Number → WS VisitLot → WS Connected → join settle → close
  * VU (parallel):
- *   Login → WS Rejoin (VisitLot → Connected) → Bidding Send (+ ACK loop) → WS Hold
+ *   Login → WS Rejoin (VisitLot → Connected) → Bidding Send (+ ACK loop) → close WS
+ * teardown (sequential, หลังทุก VU จบ):
+ *   Login → leaveLot → disconnected ทีละ buyer จนครบ
  *
  * Naming (refactored v2):
  *   - JS handles: camelCase ชัดเจน (BUYER_USERS, CONFIG.*, loginOkCounter, ackState, ...)
@@ -32,9 +34,9 @@
  *   WS_RECONNECT=true     # remote_close/error แล้ว reconnect จนครบ WS_HOLD wall-clock
  *   WS_RECONNECT_DELAY_MS # รอก่อน reconnect (default 1000)
  *   WS_RECONNECT_MAX      # 0 = ไม่จำกัดจนหมด hold (default 0)
- *   DISCONNECTED=true|false # หลัง bidding → Phase 4: (1) รอ barrier รวมทุก VU บิดครบ (2) disconnect ทีละคน
- *                          # k6 VU แชร์ state กันไม่ได้ — barrier เป็นเวลา absolute จาก setup() แล้วค่อยคิวตาม VU
- *   DISCONNECT_GAP_MS     # หน่วงระหว่าง step disconnect คนที่ n กับ n+1 (default 100)
+ *   DISCONNECTED=true|false # หลังทุก VU จบ → teardown(): login→leaveLot→disconnected ทีละ buyer จนครบ
+ *   DISCONNECT_GAP_MS     # หน่วงระหว่าง buyer ใน teardown (default 100)
+ *   TEARDOWN_TIMEOUT      # override งบ teardown (default คิดจากจำนวน buyer)
  *   SETUP_TIMEOUT=30m, WS_HOLD, JOIN_SETTLE_MS, LOG_WS_MSG, REPORT_DIR, REPORT_BASENAME
  *   PLAIN_LOG=true / NO_COLOR=true  # ปิดสี/ไอคอนใน log (เหมาะกับ --console-output=file หรือ CI)
  *   VU results JSON: {REPORT_DIR}/{REPORT_BASENAME}-vu-complete.json
@@ -154,7 +156,7 @@ const FLOW_STEP_LABELS = {
   wsClose: 'WS Closed Normally',
   reconnect: 'WS Reconnect',
   hold: 'WS Hold',
-  // Phase 4: Disconnect cleanup (optional)
+  // Phase 4: Disconnect cleanup in teardown() (optional)
   leaveLot: 'WS LeaveLot',
   disconnected: 'WS Disconnected',
 };
@@ -250,7 +252,7 @@ const CONFIG = {
   lotBidderRetryMs: Number(__ENV.LOT_BIDDER_RETRY_MS || 500),
   httpTimeoutMs: Number(__ENV.HTTP_TIMEOUT_MS || 15000),
   logWsMessages: envFlag('LOG_WS_MSG', false),
-  // หลัง bidding: leaveLot → disconnected ทีละ VU (cleanup — ไม่นับ metric)
+  // หลังทุก VU จบ: teardown() login → leaveLot → disconnected ทีละ buyer (cleanup — ไม่นับ metric)
   disconnectedEnabled: envFlag('DISCONNECTED', true),
   disconnectGapMs: Number(__ENV.DISCONNECT_GAP_MS || 100),
 };
@@ -302,43 +304,25 @@ const WS_RECONNECT_ENABLED = CONFIG.wsReconnectEnabled;
 const WS_RECONNECT_DELAY_MS = CONFIG.wsReconnectDelayMs;
 const WS_RECONNECT_MAX = CONFIG.wsReconnectMax;
 
-/** หน่วงคิว disconnect ทีละคน หลัง barrier รวมแล้ว — (vu-1)×turnMs */
-function disconnectTurnWaitMs(vuIndex) {
-  const vu = Math.max(1, Number(vuIndex) || 1);
+/** งบ teardown: login + WS leaveLot/disconnected ทีละ buyer + gap */
+function teardownDisconnectBudgetMs() {
+  const n = Math.max(1, BUYER_USERS.length);
   const turnMs = Math.max(DISCONNECT_GAP_MS, 50);
-  return Math.max(0, vu - 1) * turnMs;
+  return n * (HTTP_TIMEOUT_MS + WS_TIMEOUT_MS + turnMs + 5000) + 120000;
 }
 
-/** เวลารอให้ VU สุดท้ายเข้า bidding แล้วบิดครบ (นับจากปลาย setup) */
-function disconnectBarrierOffsetMs() {
-  const n = Math.max(1, VUS);
-  const spreadMs = Math.max(WS_REJOIN_STAGGER_MS, STAGGER_MS, DISCONNECT_GAP_MS);
-  return (
-    Math.max(0, n - 1) * spreadMs +
-    BIDDING_DURATION_MS +
-    JOIN_SETTLE_MS +
-    ACK_TIMEOUT_MS +
-    30000
-  );
+function resolveTeardownTimeout() {
+  const raw = String(__ENV.TEARDOWN_TIMEOUT || __ENV.TEARDOWN_TIMEOUT_MS || '').trim();
+  if (raw) return msToDuration(parseDurationMs(raw, teardownDisconnectBudgetMs()));
+  if (!DISCONNECTED_ENABLED) return '30s';
+  return msToDuration(teardownDisconnectBudgetMs());
 }
 
-/** budget รวมของ scenario เมื่อ disconnect — สูตรจากจำนวน VU */
-function disconnectScenarioBudgetMs() {
-  const n = Math.max(1, VUS);
-  const turnMs = Math.max(DISCONNECT_GAP_MS, 50);
-  return (
-    disconnectBarrierOffsetMs() +
-    Math.max(0, n - 1) * turnMs +
-    n * 5000 +
-    180000
-  );
-}
-
-const DISCONNECT_CLEANUP_MS = DISCONNECTED_ENABLED ? disconnectScenarioBudgetMs() - BIDDING_DURATION_MS : 0;
-// disconnect ทำใน group 4 (barrier → คิวทีละคน → WS leaveLot) — WS hold ครอบแค่ bidding + drain
+// leaveLot/disconnected ทำใน teardown() หลังทุก VU จบ — WS hold ครอบแค่ bidding + drain
 const WS_HOLD_MS = DISCONNECTED_ENABLED
   ? BIDDING_DURATION_MS + ACK_TIMEOUT_MS + JOIN_SETTLE_MS + 30000
   : BIDDING_DURATION_MS + POST_BID_HOLD_MS;
+const TEARDOWN_TIMEOUT = resolveTeardownTimeout();
 
 // Log action names — single source of truth (JS key -> wire action string).
 // Convention: <domain>.<step>.<phase> e.g. auth.login.ok, ws.join.setup.ok
@@ -447,15 +431,13 @@ function resolveSetupTimeout() {
 const SETUP_TIMEOUT = resolveSetupTimeout();
 
 const REJOIN_STAGGER_BUDGET_MS = Math.max(0, (Math.max(1, VUS) - 1) * Math.max(0, WS_REJOIN_STAGGER_MS));
-const SCENARIO_WALL_CLOCK_MS = DISCONNECTED_ENABLED
-  ? REJOIN_STAGGER_BUDGET_MS + disconnectScenarioBudgetMs()
-  : WS_HOLD_MS + WS_TIMEOUT_MS + REJOIN_STAGGER_BUDGET_MS + 120000;
+// VU scenario จบที่ bidding+drain — disconnect ไม่กิน maxDuration ของ scenario อีกต่อไป
+const SCENARIO_WALL_CLOCK_MS =
+  WS_HOLD_MS + WS_TIMEOUT_MS + REJOIN_STAGGER_BUDGET_MS + 120000;
 const MAX_DURATION =
   __ENV.MAX_DURATION ||
   `${Math.max(2, Math.ceil(SCENARIO_WALL_CLOCK_MS / 60000))}m`;
-const GRACEFUL_STOP = DISCONNECTED_ENABLED
-  ? msToDuration(Math.max(180000, Math.max(0, VUS - 1) * Math.max(DISCONNECT_GAP_MS, 50) + 120000))
-  : '10s';
+const GRACEFUL_STOP = '30s';
 
 function nowIso() {
   return new Date().toISOString();
@@ -633,18 +615,18 @@ function logRunBanner() {
     ['PHASE 1 (PREREQ)', `setup=sequential (login → lot-bidder → wsJoin) · vu=staggered start (${WS_REJOIN_STAGGER_MS}ms login→join) · settle=${JOIN_SETTLE_MS}ms`],
     ['PHASE 2 (BIDDING)', `${BIDDING_ENABLED ? `window=${msToDuration(BIDDING_DURATION_MS)} · ack=${ACK_ENABLED ? 'on' : 'off'} · order=${BIDDING_ORDER}${BIDDING_ORDER === 'sequence' ? ` (turn=${BIDDING_TURN_MS}ms · cycle≈${VUS * BIDDING_TURN_MS}ms)` : ''} · gap=${biddingGapMs()}ms · stagger=${STAGGER_MS}ms` : 'disabled'}`],
     ['PHASE 3 (POSTREQ)', DISCONNECTED_ENABLED
-      ? `drainPendingAck → then PHASE 4 Disconnect (leaveLot→disconnected · vu1→vu${VUS} · gap=${DISCONNECT_GAP_MS}ms · after ALL bidding done) · totalHold≈${msToDuration(WS_HOLD_MS)}`
+      ? `drainPendingAck → close bidding WS → teardown leaveLot→disconnected (sequential buyers · gap=${DISCONNECT_GAP_MS}ms) · totalHold≈${msToDuration(WS_HOLD_MS)}`
       : `postBidHold=${msToDuration(POST_BID_HOLD_MS)} · drainPendingAck=on · totalHold=${msToDuration(WS_HOLD_MS)} · reconnect=${WS_RECONNECT_ENABLED ? 'on' : 'off'}`],
     ...(DISCONNECTED_ENABLED
       ? [
           [
-            'PHASE 4 (DISCONNECT)',
-            `step1=wait all bidding (barrier=${msToDuration(disconnectBarrierOffsetMs())}) · step2=vu1→vu${VUS} gap=${DISCONNECT_GAP_MS}ms · budget=${msToDuration(disconnectScenarioBudgetMs())}`,
+            'TEARDOWN (DISCONNECT)',
+            `login→leaveLot→disconnected · buyer1→buyer${BUYER_USERS.length} · gap=${DISCONNECT_GAP_MS}ms · budget=${TEARDOWN_TIMEOUT}`,
           ],
           ['SCENARIO LIMITS', `maxDuration=${MAX_DURATION} · gracefulStop=${GRACEFUL_STOP} · wallClock≈${msToDuration(SCENARIO_WALL_CLOCK_MS)}`],
         ]
       : []),
-    ['TIMEOUTS', `setup=${SETUP_TIMEOUT} · wsJoin=${WS_TIMEOUT_MS}ms · http=${HTTP_TIMEOUT_MS}ms`],
+    ['TIMEOUTS', `setup=${SETUP_TIMEOUT} · teardown=${TEARDOWN_TIMEOUT} · wsJoin=${WS_TIMEOUT_MS}ms · http=${HTTP_TIMEOUT_MS}ms`],
   ]);
 }
 
@@ -676,6 +658,7 @@ function buildScenario() {
 
 export const options = {
   setupTimeout: SETUP_TIMEOUT,
+  teardownTimeout: TEARDOWN_TIMEOUT,
   scenarios: {
     buyer_send_bidding: buildScenario(),
   },
@@ -1107,8 +1090,6 @@ function prepareLotBidderNumbers() {
     preparedCount: Object.keys(preparedByBuyer).length,
     failedUsernames: failedBuyers,
     prepareMode: 'setup-sequential-lot-bidder-and-ws-join',
-    // absolute time: หลังจุดนี้ถือว่าทุก VU ควรบิดครบแล้ว → เริ่มคิว disconnect ทีละคน
-    disconnectBarrierAtMs: DISCONNECTED_ENABLED ? Date.now() + disconnectBarrierOffsetMs() : 0,
   };
 }
 
@@ -1439,7 +1420,8 @@ function runSetupWsJoin(session, bidderNumber, opts) {
 }
 
 /**
- * Group 4 — leaveLot → disconnected บน WS ใหม่ (cleanup เท่านั้น · ไม่นับ metric)
+ * teardown — leaveLot → disconnected บน WS ใหม่ (cleanup เท่านั้น · ไม่นับ metric)
+ * ส่งข้อความแล้วรอ settle สั้น ๆ ก่อน close เพื่อลดโอกาสที่ server ไม่ทันประมวลผล
  */
 function runDisconnectOnly(session) {
   const buyer = session.buyer;
@@ -1453,10 +1435,11 @@ function runDisconnectOnly(session) {
   const url = `${WS_URL}?userType=${encodeURIComponent(buyer.loginType)}&service=websocket-service`;
   let done = false;
   let failed = false;
+  const settleMs = Math.max(200, Math.min(1000, JOIN_SETTLE_MS || 200));
 
   const res = ws.connect(
     url,
-    { headers, tags: { name: 'WS disconnect cleanup', username: buyer.username, phase: 'disconnect' } },
+    { headers, tags: { name: 'WS disconnect cleanup', username: buyer.username, phase: 'teardown' } },
     function (socket) {
       socket.on('open', function () {
         sendWsMessage(socket, buyer, 'leaveLot', {
@@ -1474,10 +1457,12 @@ function runDisconnectOnly(session) {
         });
         logInfo(
           ACTION_NAMES.wsHoldEnd,
-          `buyer=${buyer.username} lotId=${LOT_ID} leaveLot+disconnected done → closing WS`
+          `buyer=${buyer.username} lotId=${LOT_ID} leaveLot+disconnected sent → settle ${settleMs}ms then close WS`
         );
-        done = true;
-        socket.close();
+        socket.setTimeout(function () {
+          done = true;
+          socket.close();
+        }, settleMs);
       });
 
       socket.on('message', function (raw) {
@@ -1494,7 +1479,7 @@ function runDisconnectOnly(session) {
 
       socket.on('error', function (e) {
         failed = true;
-        logError(ACTION_NAMES.wsSocketError, `buyer=${buyer.username} phase=disconnect error=${e}`);
+        logError(ACTION_NAMES.wsSocketError, `buyer=${buyer.username} phase=teardown error=${e}`);
       });
 
       socket.setTimeout(function () {
@@ -1877,7 +1862,7 @@ function runWsRejoinBidding(session, bidderNumber, opts) {
             logInfo(
               ACTION_NAMES.biddingLoopEnd,
               DISCONNECTED_ENABLED
-                ? `buyer=${buyer.username} [Phase 2 Bidding Complete] duration=${activeDuration}ms (full window) → drain ACK แล้วเข้า Phase 4 Disconnect (หลังทุก VU ครบ bidding)`
+                ? `buyer=${buyer.username} [Phase 2 Bidding Complete] duration=${activeDuration}ms (full window) → drain ACK แล้วปิด WS (teardown จะ leaveLot/disconnected)`
                 : `buyer=${buyer.username} [Phase 2 Bidding Complete] duration=${activeDuration}ms → entering Phase 3 Postrequisite (drain ACK + post-bid hold ${postBidHoldMs}ms)`
             );
 
@@ -1894,13 +1879,13 @@ function runWsRejoinBidding(session, bidderNumber, opts) {
 
               const elapsedDrain = Date.now() - drainStartTime;
 
-              // DISCONNECTED: ปิด WS หลัง drain — leaveLot/disconnect ทำใน group 4 (sleep ตามจำนวน VU)
+              // DISCONNECTED: ปิด WS หลัง drain — leaveLot/disconnect ทำใน teardown() ทีละ buyer
               if (DISCONNECTED_ENABLED) {
                 holdTimerFired = true;
                 holding = false;
                 logInfo(
                   ACTION_NAMES.wsHoldEnd,
-                  `buyer=${buyer.username} lotId=${LOT_ID} bidding+drain done → close WS (group 4 leaveLot/disconnect)`
+                  `buyer=${buyer.username} lotId=${LOT_ID} bidding+drain done → close WS (teardown leaveLot/disconnect)`
                 );
                 socket.close();
                 return;
@@ -2371,48 +2356,6 @@ export default function (setupData) {
       return;
     }
 
-    if (DISCONNECTED_ENABLED) {
-      const vuIndex = typeof __VU !== 'undefined' && __VU > 0 ? __VU : 1;
-      const n = Math.max(1, VUS);
-      const turnMs = Math.max(DISCONNECT_GAP_MS, 50);
-      const barrierAtMs =
-        setupData && setupData.disconnectBarrierAtMs
-          ? Number(setupData.disconnectBarrierAtMs)
-          : Date.now() + disconnectBarrierOffsetMs();
-      group(
-        `4. Disconnect [${FLOW_STEP_LABELS.leaveLot} → ${FLOW_STEP_LABELS.disconnected}] (${buyer.username})`,
-        function () {
-          // Step 1: รอให้ทุกคนบิดครบ (barrier รวม) — ยังไม่ disconnect
-          const waitBarrierMs = Math.max(0, barrierAtMs - Date.now());
-          logInfo(
-            ACTION_NAMES.leaveLotWait,
-            `buyer=${buyer.username} vu=${vuIndex}/${n} step=1/2 waitAllBiddingDoneMs=${waitBarrierMs} barrierAt=${new Date(barrierAtMs).toISOString()} — wait until ALL VUs finish bidding`
-          );
-          if (waitBarrierMs > 0) {
-            sleep(waitBarrierMs / 1000);
-          }
-
-          // Step 2: disconnect ทีละคน ตามลำดับ VU1 → VU2 → … → VUN
-          const turnWaitMs = disconnectTurnWaitMs(vuIndex);
-          logInfo(
-            ACTION_NAMES.leaveLotWait,
-            `buyer=${buyer.username} vu=${vuIndex}/${n} step=2/2 turnWaitMs=${turnWaitMs} formula=(vu-1)×${turnMs} — sequential leaveLot→disconnected`
-          );
-          if (turnWaitMs > 0) {
-            sleep(turnWaitMs / 1000);
-          }
-
-          const disc = runDisconnectOnly(session);
-          if (!disc.ok) {
-            logWarn(
-              ACTION_NAMES.leaveLotWait,
-              `buyer=${buyer.username} vu=${vuIndex}/${n} disconnect cleanup failed error=${disc.error || '-'}`
-            );
-          }
-        }
-      );
-    }
-
     rec.step = (wsResult && wsResult.step) || 'ws.hold.end';
     rec.outcome = 'ok';
     rec.result = 'PASS';
@@ -2433,6 +2376,91 @@ export default function (setupData) {
     rec.at = nowIso();
     recordVuComplete(rec);
   }
+}
+
+/**
+ * หลังทุก VU จบ: login → leaveLot → disconnected ทีละ buyer จนครบ
+ * (k6 teardown รันครั้งเดียวแบบ sequential — ไม่แชร์ socket จาก VU ได้)
+ */
+export function teardown(setupData) {
+  if (!DISCONNECTED_ENABLED) {
+    logInfo('teardown.skip', 'DISCONNECTED=false — skip leaveLot/disconnected');
+    return;
+  }
+
+  requireEnv();
+
+  const buyers = BUYER_USERS;
+  const total = buyers.length;
+  const turnMs = Math.max(DISCONNECT_GAP_MS, 50);
+  let okCount = 0;
+  let failCount = 0;
+  const prepared =
+    setupData && setupData.preparedByUsername ? setupData.preparedByUsername : {};
+
+  logSetupDivider('teardown leaveLot→disconnected START', '🧹');
+  logSetup(
+    'teardown.config',
+    `buyers=${total} prepared=${setupData && setupData.preparedCount != null ? setupData.preparedCount : '-'} gapMs=${turnMs} lotId=${LOT_ID} timeout=${TEARDOWN_TIMEOUT}`,
+    { phase: 'CONFIG' }
+  );
+  logSetupRule();
+
+  for (let i = 0; i < total; i++) {
+    const buyer = buyers[i];
+    const round = `${i + 1}/${total}`;
+    const setupMeta = { round: round };
+    const wasPrepared = !!(prepared[buyer.username] && prepared[buyer.username].joinOk);
+
+    logSetupDivider(`TEARDOWN ${round} — ${buyer.username}`, '👋');
+    logSetup(
+      ACTION_NAMES.leaveLotWait,
+      `buyer=${buyer.username} ${round} prepared=${wasPrepared} — login → leaveLot → disconnected`,
+      Object.assign({}, setupMeta, { phase: 'DISCONNECT' })
+    );
+
+    const loginResult = login(buyer, { setupMeta: setupMeta });
+    if (!loginResult.session) {
+      failCount += 1;
+      logSetup(
+        'teardown.buyer.result',
+        `buyer=${buyer.username} reason=login_failed`,
+        Object.assign({}, setupMeta, { phase: 'RESULT', status: 'FAIL' })
+      );
+      logSetupRule();
+      if (turnMs > 0 && i < total - 1) sleep(turnMs / 1000);
+      continue;
+    }
+
+    const disc = runDisconnectOnly(loginResult.session);
+    if (disc.ok) {
+      okCount += 1;
+      logSetup(
+        'teardown.buyer.result',
+        `buyer=${buyer.username} leaveLot+disconnected ok`,
+        Object.assign({}, setupMeta, { phase: 'RESULT', status: 'OK' })
+      );
+    } else {
+      failCount += 1;
+      logSetup(
+        'teardown.buyer.result',
+        `buyer=${buyer.username} error=${disc.error || '-'}`,
+        Object.assign({}, setupMeta, { phase: 'RESULT', status: 'FAIL' })
+      );
+    }
+    logSetupRule();
+
+    if (turnMs > 0 && i < total - 1) {
+      sleep(turnMs / 1000);
+    }
+  }
+
+  logSetupDivider('teardown leaveLot→disconnected DONE', '🏁');
+  logSetup(
+    'teardown.summary',
+    `ok=${okCount} fail=${failCount} total=${total}`,
+    { phase: 'SUMMARY', status: failCount > 0 ? 'PARTIAL' : 'OK' }
+  );
 }
 
 export const handleSummary = createHandleSummary(function (data) {
@@ -2504,6 +2532,7 @@ export const handleSummary = createHandleSummary(function (data) {
       biddingTurnMs: BIDDING_TURN_MS,
       disconnected: DISCONNECTED_ENABLED,
       disconnectGapMs: DISCONNECT_GAP_MS,
+      teardownTimeout: TEARDOWN_TIMEOUT,
       lotBidderGapMs: LOT_BIDDER_GAP_MS,
       wsJoinGapMs: WS_JOIN_GAP_MS,
       lotBidderRetries: LOT_BIDDER_RETRIES,
@@ -2518,7 +2547,7 @@ export const handleSummary = createHandleSummary(function (data) {
       prereqStages: ['login', 'lot_bidder_number', 'ws_visitlot', 'ws_connected', 'ws_join_prepare'],
       biddingStages: ['bidding_send', 'bidding_ack'],
       postreqStages: DISCONNECTED_ENABLED
-        ? ['pending_ack_drain', 'leave_lot', 'disconnected', 'ws_close']
+        ? ['pending_ack_drain', 'ws_close', 'teardown_leave_lot', 'teardown_disconnected']
         : ['pending_ack_drain', 'post_bid_hold', 'ws_close', 'ws_reconnect'],
       lotLineId: LOT_LINE_ID,
       auctionNo: AUCTION_NO,

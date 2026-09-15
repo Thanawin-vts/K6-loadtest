@@ -48,7 +48,9 @@
 #   POST_BID_HOLD
 #   BIDDING_ORDER       (sequence [default] | parallel)
 #   BIDDING_TURN_MS     (ms per slot in sequence mode, default 2000)
-#   DISCONNECTED        (true|false — หลัง bidding ทำ leaveLot→disconnected ทีละ VU, default true)
+#   DISCONNECTED        (true|false — หลังทุก VU จบ teardown() ทำ leaveLot→disconnected ทีละ buyer, default true)
+#   DISCONNECT_GAP_MS   (ms ระหว่าง buyer ใน teardown, default 100)
+#   TEARDOWN_TIMEOUT    (override งบ teardown; default คิดจากจำนวน buyer)
 #
 #   ACK
 #   ACK_TIMEOUT_MS
@@ -448,6 +450,7 @@ K6_ARGS=(
   -e "BIDDING_DELAY_MS=${BIDDING_DELAY_MS}"
   -e "BIDDING_TURN_MS=${BIDDING_TURN_MS}"
   -e "DISCONNECTED=${DISCONNECTED}"
+  -e "DISCONNECT_GAP_MS=${DISCONNECT_GAP_MS:-100}"
 
   -e "ACK=${ACK:-true}"
 
@@ -458,6 +461,7 @@ K6_ARGS=(
   -e "WS_RECONNECT_MAX=${WS_RECONNECT_MAX:-0}"
 
   -e "SETUP_TIMEOUT=${SETUP_TIMEOUT:-0}"
+  -e "TEARDOWN_TIMEOUT=${TEARDOWN_TIMEOUT:-}"
 
   -e "REPORT_DIR=${REPORT_DIR}"
   -e "REPORT_BASENAME=${REPORT_BASENAME}"
@@ -660,7 +664,8 @@ WS Reconnect     : ${WS_RECONNECT:-true}
 Reconnect Delay  : ${WS_RECONNECT_DELAY_MS:-1000} ms
 Reconnect Max    : ${WS_RECONNECT_MAX:-0}
 
-Disconnected     : $DISCONNECTED
+Disconnected     : $DISCONNECTED (teardown sequential leaveLot→disconnected)
+Disconnect Gap   : ${DISCONNECT_GAP_MS:-100} ms
 
 Start Date Time  : $START_TIME
 End Date Time    : $END_TIME
