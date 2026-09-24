@@ -1,0 +1,398 @@
+==================================================
+BIDDING KPI ENHANCEMENT
+IMPLEMENTATION ANALYSIS & PLAN
+==================================================
+
+## 1. OBJECTIVE
+
+Add 2 new bidding latency KPIs to the existing k6 performance
+test and report.
+
+The existing KPIs must remain unchanged.
+
+The implementation scope covers the complete flow:
+
+k6 test
+    ↓
+WebSocket bidding flow
+    ↓
+KPI calculation
+    ↓
+k6 metrics
+    ↓
+report data
+    ↓
+report generation
+    ↓
+final report
+
+
+## 2. BUSINESS RULE
+
+1. Existing KPIs
+   - Keep all existing KPIs unchanged.
+   - Do not modify their existing calculation logic.
+   - Do not change their existing names or behavior unless required.
+
+2. Bidding KPI
+   - Measure the duration of every bidding transaction.
+   - There are 2 response cases.
+
+   2.1 Bidding Success
+       Start:
+         When bidding is sent through WebSocket.
+
+       End:
+         When the corresponding bidInfo WebSocket message is received.
+
+       KPI:
+         bidding_success_duration
+
+   2.2 Bidding Failure
+       Start:
+         When bidding is sent through WebSocket.
+
+       End:
+         When the corresponding notification WebSocket message
+         with level = error is received.
+
+       KPI:
+         bidding_failure_duration
+
+
+## 3. REQUIRED WORKFLOW
+
+The implementation must cover:
+
+1. k6 test
+2. WebSocket message handling
+3. Bidding request tracking
+4. Response correlation
+5. KPI calculation
+6. k6 metric registration/recording
+7. Metric export
+8. Report data processing
+9. Report generation
+10. Final KPI presentation
+
+
+## 4. IMPORTANT CONSTRAINT
+
+DO NOT IMPLEMENT CODE IN THE FIRST PHASE.
+
+First analyze the existing codebase and produce an
+implementation plan.
+
+The analysis must be based on the existing implementation.
+Do not assume or invent behavior that is not present in the code.
+
+
+## 5. EXISTING IMPLEMENTATION ANALYSIS
+
+Analyze and identify:
+
+### 5.1 k6 Structure
+- k6 entry point
+- options
+- scenarios
+- setup()
+- default()
+- teardown()
+- handleSummary()
+
+### 5.2 WebSocket
+- WebSocket connection implementation
+- WebSocket send implementation
+- WebSocket message event handler
+- Message parsing
+- Existing message type handling
+- Connection lifecycle
+
+### 5.3 Existing Bidding Flow
+Identify:
+
+bidding send
+    ↓
+message handling
+    ↓
+bidInfo
+    OR
+notification level=error
+
+Document the actual implementation flow.
+
+### 5.4 Existing KPI
+Identify all existing custom KPIs.
+
+For each KPI provide:
+
+- metric name
+- metric type
+- creation location
+- recording location
+- calculation logic
+- report usage
+
+### 5.5 Existing Timing Mechanism
+Identify how the current implementation measures time.
+
+Check whether it uses:
+
+- Date.now()
+- performance.now()
+- k6 Trend
+- custom timestamp
+- WebSocket timestamp
+- server timestamp
+- other mechanism
+
+
+## 6. CORRELATION ANALYSIS
+
+Determine how the existing implementation identifies
+which response belongs to which bidding request.
+
+Analyze:
+
+bidding request → bidInfo
+
+and:
+
+bidding request → error notification
+
+The implementation must not incorrectly match responses
+when multiple bidding requests are active.
+
+If the existing implementation does not contain sufficient
+correlation information, document the gap before proposing
+a solution.
+
+
+## 7. TIMING DEFINITION
+
+Success:
+
+bidding_success_duration =
+    bidInfo_received_timestamp
+    -
+    bidding_sent_timestamp
+
+
+Failure:
+
+bidding_failure_duration =
+    error_notification_received_timestamp
+    -
+    bidding_sent_timestamp
+
+
+Use the existing timing mechanism where appropriate.
+
+Do not introduce a different timing mechanism without
+explaining why.
+
+
+## 8. NEW KPI
+
+### 8.1 bidding_success_duration
+
+Purpose:
+Measure the duration from sending bidding to receiving
+the corresponding bidInfo message.
+
+Expected metric type:
+Trend
+
+Required statistics:
+
+- avg
+- min
+- med
+- max
+- p90
+- p95
+
+
+### 8.2 bidding_failure_duration
+
+Purpose:
+Measure the duration from sending bidding to receiving
+the corresponding notification with level=error.
+
+Expected metric type:
+Trend
+
+Required statistics:
+
+- avg
+- min
+- med
+- max
+- p90
+- p95
+
+
+## 9. EDGE CASE ANALYSIS
+
+Analyze the current behavior and define handling for:
+
+1. Bidding sent but no response
+2. Response arrives after timeout
+3. Error notification without matching bidding
+4. Multiple bidding requests in parallel
+5. Multiple bidInfo messages
+6. Duplicate messages
+7. WebSocket disconnect before response
+8. Invalid WebSocket message
+9. Bidding send failure
+
+For each case document:
+
+- current behavior
+- expected behavior
+- whether KPI should be recorded
+- proposed implementation
+
+
+## 10. REPORT ANALYSIS
+
+Identify the complete report pipeline.
+
+Document:
+
+1. k6 metric output
+2. metric transformation
+3. report data model
+4. aggregation logic
+5. report template
+6. KPI table/component
+7. existing KPI rendering logic
+
+Determine exactly which files must be changed
+to display the 2 new KPIs.
+
+
+## 11. BACKWARD COMPATIBILITY
+
+Existing KPI results must remain unchanged.
+
+Verify:
+
+- existing metric names
+- existing metric calculation
+- existing report values
+- existing report layout
+- existing scenarios
+- existing thresholds
+
+Do not refactor unrelated code unless required.
+
+
+## 12. TEST ANALYSIS
+
+Identify existing tests related to:
+
+- WebSocket
+- bidding
+- KPI
+- metrics
+- report generation
+
+Determine which tests need to be updated
+and which new tests are required.
+
+
+## 13. IMPLEMENTATION PLAN
+
+After completing the analysis, provide an implementation plan.
+
+For each change provide:
+
+1. File path
+2. Existing function/component
+3. Change required
+4. Reason
+5. Dependencies
+6. Risk
+7. Test coverage
+
+
+## 14. EXPECTED OUTPUT FROM ANALYSIS
+
+Before writing any code, provide:
+
+### A. Current Architecture
+
+Show:
+
+k6
+ ↓
+WebSocket
+ ↓
+Bidding
+ ↓
+Response
+ ↓
+KPI
+ ↓
+Report
+
+
+### B. Relevant Files
+
+List all relevant files and explain their responsibility.
+
+
+### C. Current KPI Flow
+
+Explain how existing KPIs are currently generated
+and displayed.
+
+
+### D. Gap Analysis
+
+Identify what is currently missing to support
+the 2 new KPIs.
+
+
+### E. Proposed Design
+
+Explain how the new KPI flow should work.
+
+
+### F. File Change Plan
+
+List files that will need modification/addition.
+
+
+### G. Risk / Edge Cases
+
+List potential problems and how they should be handled.
+
+
+### H. Test Plan
+
+Explain how the implementation will be validated.
+
+
+### I. Open Questions
+
+List anything that cannot be determined from the
+existing codebase.
+
+Do not make assumptions for unresolved questions.
+
+
+## 15. IMPLEMENTATION RULE
+
+IMPORTANT:
+
+Phase 1:
+ANALYZE ONLY.
+
+Do not modify files.
+Do not create implementation code.
+Do not refactor existing code.
+
+After the analysis and implementation plan are presented,
+wait for approval before implementing the changes.

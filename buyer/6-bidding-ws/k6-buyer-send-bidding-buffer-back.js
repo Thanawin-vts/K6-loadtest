@@ -36,8 +36,8 @@
  *   WS_RECONNECT_MAX      # 0 = ไม่จำกัดจนหมด hold (default 0)
  *   DISCONNECTED=true|false # หลังทุก VU จบ → teardown(): login→leaveLot→disconnected ทีละ buyer จนครบ
  *   DISCONNECT_GAP_MS     # หน่วงระหว่าง buyer ใน teardown (default 100)
- *   TEARDOWN_TIMEOUT      # override งบ teardown (default 1h)
- *   SETUP_TIMEOUT=1h, GRACEFUL_STOP=30m, WS_HOLD, JOIN_SETTLE_MS, LOG_WS_MSG, REPORT_DIR, REPORT_BASENAME
+ *   TEARDOWN_TIMEOUT      # override งบ teardown (default คิดจากจำนวน buyer)
+ *   SETUP_TIMEOUT=30m, WS_HOLD, JOIN_SETTLE_MS, LOG_WS_MSG, REPORT_DIR, REPORT_BASENAME
  *   PLAIN_LOG=true / NO_COLOR=true  # ปิดสี/ไอคอนใน log (เหมาะกับ --console-output=file หรือ CI)
  *   VU results JSON: {REPORT_DIR}/{REPORT_BASENAME}-vu-complete.json
  *   Dashboard: HTML "Run Summary & Flow Counts" ใช้ FLOW_STEP_LABELS เดียวกับ log/stdout
@@ -86,10 +86,6 @@ const wsSessionDurationMs = new Trend('ws_session_duration_ms');
 const wsJoinPrepareDurationMs = new Trend('ws_join_prepare_duration_ms');
 // ACK round-trip: send `bidding` -> receive matching `notification/broadcast` (ms).
 const ackWaitDurationMs = new Trend('ws_ack_wait_ms');
-// Offer outcome: send `bidding` -> matching `bidInfo` or `notification` level=error.
-// Separate from ws_ack_wait_ms. No sample on timeout, disconnect, or send failure.
-const biddingSuccessDurationMs = new Trend('bidding_success_duration');
-const biddingFailureDurationMs = new Trend('bidding_failure_duration');
 const loginOkCounter = new Counter('login_ok');
 const loginFailCounter = new Counter('login_fail');
 const visitLotOkCounter = new Counter('visit_lot_ok');
@@ -308,9 +304,18 @@ const WS_RECONNECT_ENABLED = CONFIG.wsReconnectEnabled;
 const WS_RECONNECT_DELAY_MS = CONFIG.wsReconnectDelayMs;
 const WS_RECONNECT_MAX = CONFIG.wsReconnectMax;
 
+/** งบ teardown: login + WS leaveLot/disconnected ทีละ buyer + gap */
+function teardownDisconnectBudgetMs() {
+  const n = Math.max(1, BUYER_USERS.length);
+  const turnMs = Math.max(DISCONNECT_GAP_MS, 50);
+  return n * (HTTP_TIMEOUT_MS + WS_TIMEOUT_MS + turnMs + 5000) + 120000;
+}
+
 function resolveTeardownTimeout() {
-  const raw = String(__ENV.TEARDOWN_TIMEOUT || __ENV.TEARDOWN_TIMEOUT_MS || '1h').trim();
-  return msToDuration(parseDurationMs(raw, 60 * 60 * 1000));
+  const raw = String(__ENV.TEARDOWN_TIMEOUT || __ENV.TEARDOWN_TIMEOUT_MS || '').trim();
+  if (raw) return msToDuration(parseDurationMs(raw, teardownDisconnectBudgetMs()));
+  if (!DISCONNECTED_ENABLED) return '30s';
+  return msToDuration(teardownDisconnectBudgetMs());
 }
 
 // leaveLot/disconnected ทำใน teardown() หลังทุก VU จบ — WS hold ครอบแค่ bidding + drain
@@ -413,12 +418,14 @@ function biddingGapMs() {
   return ACK_COOLDOWN_MS + BIDDING_DELAY_MS;
 }
 
+const SETUP_UNLIMITED_MS = 24 * 60 * 60 * 1000;
+
 function resolveSetupTimeout() {
-  const raw = String(__ENV.SETUP_TIMEOUT || __ENV.SETUP_TIMEOUT_MS || '1h').trim();
+  const raw = String(__ENV.SETUP_TIMEOUT || __ENV.SETUP_TIMEOUT_MS || '0').trim();
   if (['0', '0s', '0ms', 'unlimited', 'none', 'inf', 'infinite'].includes(raw.toLowerCase())) {
     return '24h';
   }
-  return msToDuration(parseDurationMs(raw, 60 * 60 * 1000));
+  return msToDuration(parseDurationMs(raw, SETUP_UNLIMITED_MS));
 }
 
 const SETUP_TIMEOUT = resolveSetupTimeout();
@@ -430,9 +437,7 @@ const SCENARIO_WALL_CLOCK_MS =
 const MAX_DURATION =
   __ENV.MAX_DURATION ||
   `${Math.max(2, Math.ceil(SCENARIO_WALL_CLOCK_MS / 60000))}m`;
-const GRACEFUL_STOP = msToDuration(
-  parseDurationMs(String(__ENV.GRACEFUL_STOP || __ENV.GRACEFUL_STOP_MS || '30m').trim(), 30 * 60 * 1000)
-);
+const GRACEFUL_STOP = '30s';
 
 function nowIso() {
   return new Date().toISOString();
@@ -1213,7 +1218,7 @@ function sendWs(socket, buyer, type, options) {
   return sendWsMessage(socket, buyer, type, options);
 }
 
-function sendBiddingOffer(socket, buyer, bidderNumber, reason, onSent) {
+function sendBiddingOffer(socket, buyer, bidderNumber, reason) {
   const msg = buildWsMessage('bidding', {
     lots: [LOT_ID],
     payload: {
@@ -1229,14 +1234,12 @@ function sendBiddingOffer(socket, buyer, bidderNumber, reason, onSent) {
   logInfo(ACTION_NAMES.biddingSend, `buyer=${buyer.username}${reasonStr} ts=${ts} ${summarizeWsMessage(msg)}`);
   socket.send(JSON.stringify(msg));
   biddingSent.add(1, { phase: 'bidding' });
-  // Clock starts only after send returns. A throw before this leaves no sample.
-  if (typeof onSent === 'function') onSent();
   return msg;
 }
 
 // Backward-compatible alias.
-function sendOffer(socket, buyer, bidderNumber, reason, onSent) {
-  return sendBiddingOffer(socket, buyer, bidderNumber, reason, onSent);
+function sendOffer(socket, buyer, bidderNumber, reason) {
+  return sendBiddingOffer(socket, buyer, bidderNumber, reason);
 }
 
 /**
@@ -1520,26 +1523,6 @@ function runWsRejoinBidding(session, bidderNumber, opts) {
     o.biddingStaggerMs != null ? Math.max(0, Number(o.biddingStaggerMs)) : Math.max(0, (__VU - 1) * STAGGER_MS);
 
   const buyer = session.buyer;
-  // One entry per send that returned. FIFO: the server has no request id, so a late
-  // bidInfo is attributed to the oldest outstanding send from this VU.
-  const bidOutcomeQueue = [];
-  function markBidSent() {
-    bidOutcomeQueue.push(Date.now());
-  }
-  function observeBidOutcome(msg) {
-    if (!msg || !bidOutcomeQueue.length) return;
-    const payload = msg.payload || {};
-    if (msg.type === 'bidInfo') {
-      if (!bidderNumber || payload.bidderNumber !== bidderNumber) return;
-      const sentAt = bidOutcomeQueue.shift();
-      biddingSuccessDurationMs.add(Math.max(0, Date.now() - sentAt), { phase: 'bidding' });
-      return;
-    }
-    if (msg.type === 'notification' && payload.level === 'error') {
-      const sentAt = bidOutcomeQueue.shift();
-      biddingFailureDurationMs.add(Math.max(0, Date.now() - sentAt), { phase: 'bidding' });
-    }
-  }
   const headers = {
     Authorization: `Bearer ${session.accessToken}`,
     'X-User-Type': buyer.loginType,
@@ -1625,7 +1608,7 @@ function runWsRejoinBidding(session, bidderNumber, opts) {
         ackState.ackGen += 1;
         ackState.sentAt = Date.now(); // เริ่มจับเวลารอ ACK (ws_ack_wait_ms)
         ackState.timedOut = false;
-        sendBiddingOffer(socket, buyer, bidderNumber, 'ack', markBidSent);
+        sendBiddingOffer(socket, buyer, bidderNumber, 'ack');
         armAckTimeout();
       }
 
@@ -1695,7 +1678,7 @@ function runWsRejoinBidding(session, bidderNumber, opts) {
           if (!isMyTurnSlot()) return;
           ackState.sentAt = Date.now();
           ackState.timedOut = false;
-          sendBiddingOffer(socket, buyer, bidderNumber, 'turn', markBidSent);
+          sendBiddingOffer(socket, buyer, bidderNumber, 'turn');
         }, ACK_TICK_MS);
       }
 
@@ -1710,7 +1693,7 @@ function runWsRejoinBidding(session, bidderNumber, opts) {
           if (failed || !holding || !biddingActive) return;
           ackState.sentAt = Date.now();
           ackState.timedOut = false;
-          sendBiddingOffer(socket, buyer, bidderNumber, 'interval', markBidSent);
+          sendBiddingOffer(socket, buyer, bidderNumber, 'interval');
           socket.setTimeout(tick, gapMs);
         }
         schedule(tick, alignMs);
@@ -1961,8 +1944,6 @@ function runWsRejoinBidding(session, bidderNumber, opts) {
           return;
         }
 
-        observeBidOutcome(msg);
-
         if (ACK_ENABLED && holding && BIDDING_ENABLED) {
           handleAckMessage(msg);
         }
@@ -2020,7 +2001,6 @@ function runWsRejoinBidding(session, bidderNumber, opts) {
       });
 
       socket.on('close', function () {
-        bidOutcomeQueue.length = 0;
         logInfo(
           ACTION_NAMES.wsClose,
           `buyer=${buyer.username} holdingWas=${holding} failed=${failed} phase=${ackState.phase} attempt=${attempt} holdTimerFired=${holdTimerFired}`
